@@ -599,6 +599,7 @@
         <div class="console-dot green"></div>
       </div>
       <div class="console-title">watchdog.log — live output</div>
+      <button class="console-clear" onclick="runEpisodeIndex()" style="color:var(--accent2)" title="Re-index all episodes and mark downloaded in Sonarr">↻ index episodes</button>
       <button class="console-clear" onclick="clearConsole()">clear</button>
     </div>
     <div id="console-output">
@@ -932,6 +933,11 @@
     await fetch('/api/watchdog/stop', { method:'POST' });
     setStatusPill('idle', '■ STOPPED');
     document.getElementById('stop-btn').style.display = 'none';
+  }
+
+  async function runEpisodeIndex() {
+    appendLog(new Date().toTimeString().slice(0,8), 'INFO', '🔁 Manual episode index triggered...');
+    await fetch('/api/episode-index', { method: 'POST' });
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

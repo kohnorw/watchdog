@@ -1,0 +1,518 @@
+import os
+import time
+import threading
+import logging
+import json
+import queue
+import requests
+from datetime import datetime
+from flask import Flask, render_template, jsonify, request, Response, stream_with_context
+from plexapi.server import PlexServer
+
+app = Flask(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+CONFIG_FILE = "/data/config.json"
+
+CONFIG_DEFAULTS = {
+    "PLEX_URL":               "",
+    "PLEX_TOKEN":             "",
+    "PLEX_TV_LIBRARY":        "TV Shows",
+    "SONARR_URL":             "",
+    "SONARR_API_KEY":         "",
+    "SONARR_ROOT_FOLDER":     "/tv",
+    "SONARR_QUALITY_PROFILE": "HD-1080p",
+    "TMDB_API_KEY":           "",
+    "POLL_INTERVAL":          30,
+    "SETUP_COMPLETE":         False,
+}
+
+def load_config():
+    cfg = dict(CONFIG_DEFAULTS)
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE) as f:
+            saved = json.load(f)
+            cfg.update(saved)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return cfg
+
+def save_config_to_disk(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save config: {e}")
+
+CONFIG = load_config()
+
+# ── State ─────────────────────────────────────────────────────────────────────
+log_queue = queue.Queue()
+scan_results = []
+scan_complete = False
+scan_approved = False
+watchdog_running = False
+watchdog_thread = None
+first_run = True
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+class QueueHandler(logging.Handler):
+    def emit(self, record):
+        msg = self.format(record)
+        level = record.levelname
+        log_queue.put({"time": datetime.now().strftime("%H:%M:%S"), "level": level, "msg": msg})
+
+logger = logging.getLogger("watchdog")
+logger.setLevel(logging.DEBUG)
+qh = QueueHandler()
+qh.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(qh)
+sh = logging.StreamHandler()
+sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(sh)
+
+# ── API helpers ────────────────────────────────────────────────────────────────
+def sonarr_get(path):
+    r = requests.get(f"{CONFIG['SONARR_URL']}/api/v3/{path}",
+                     headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def sonarr_post(path, payload):
+    r = requests.post(f"{CONFIG['SONARR_URL']}/api/v3/{path}",
+                      headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]},
+                      json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def tmdb_search(title, tvdb_id=None):
+    key = CONFIG["TMDB_API_KEY"]
+    if not key:
+        return {}
+    try:
+        if tvdb_id:
+            r = requests.get(
+                f"https://api.themoviedb.org/3/find/{tvdb_id}",
+                params={"api_key": key, "external_source": "tvdb_id"}, timeout=8)
+            data = r.json()
+            results = data.get("tv_results", [])
+            if results:
+                return results[0]
+        r = requests.get("https://api.themoviedb.org/3/search/tv",
+                         params={"api_key": key, "query": title}, timeout=8)
+        results = r.json().get("results", [])
+        return results[0] if results else {}
+    except Exception as e:
+        logger.warning(f"TMDB lookup failed for '{title}': {e}")
+        return {}
+
+def get_quality_profile_id():
+    profiles = sonarr_get("qualityprofile")
+    for p in profiles:
+        if p["name"].lower() == CONFIG["SONARR_QUALITY_PROFILE"].lower():
+            return p["id"]
+    return profiles[0]["id"] if profiles else 1
+
+def get_sonarr_series_map():
+    series = sonarr_get("series")
+    return {s["tvdbId"]: s for s in series if s.get("tvdbId")}
+
+def add_series_to_sonarr(show, quality_profile_id):
+    tvdb_id = show["tvdbId"]
+    title = show["title"]
+    try:
+        results = sonarr_get(f"series/lookup?term=tvdb:{tvdb_id}")
+        if not results:
+            logger.warning(f"No Sonarr lookup result for TVDB:{tvdb_id} '{title}'")
+            return False
+        lookup = results[0]
+        payload = {
+            "title": lookup["title"],
+            "tvdbId": tvdb_id,
+            "qualityProfileId": show.get("qualityProfileId", quality_profile_id),
+            "rootFolderPath": CONFIG["SONARR_ROOT_FOLDER"],
+            "seasonFolder": True,
+            "monitored": True,
+            "addOptions": {
+                "searchForMissingEpisodes": False,
+                "searchForCutoffUnmetEpisodes": False,
+                "monitor": "all"
+            },
+            "seasons": lookup.get("seasons", []),
+            "images": lookup.get("images", []),
+            "path": f"{CONFIG['SONARR_ROOT_FOLDER']}/{lookup['title']}",
+        }
+        sonarr_post("series", payload)
+        logger.info(f"✅ Added to Sonarr: {title} (TVDB:{tvdb_id})")
+        return True
+    except requests.HTTPError as e:
+        if e.response.status_code == 400:
+            logger.info(f"Already exists: {title}")
+        else:
+            logger.error(f"Failed to add {title}: {e}")
+        return False
+
+# ── Episode marking ──────────────────────────────────────────────────────────
+def mark_episodes_downloaded(plex_show, sonarr_series_id, title):
+    """Cross-reference Plex episodes against Sonarr and mark as downloaded."""
+    try:
+        sonarr_episodes = sonarr_get(f"episode?seriesId={sonarr_series_id}")
+        sonarr_ep_files = {ef["id"] for ef in sonarr_get(f"episodefile?seriesId={sonarr_series_id}")}
+    except Exception as e:
+        logger.error(f"  Failed to fetch Sonarr episodes for '{title}': {e}")
+        return 0, 0
+
+    # Build a map of (season, episode) -> sonarr episode object
+    sonarr_ep_map = {}
+    for ep in sonarr_episodes:
+        key = (ep["seasonNumber"], ep["episodeNumber"])
+        sonarr_ep_map[key] = ep
+
+    marked = 0
+    missing = 0
+
+    for plex_season in plex_show.seasons():
+        season_num = plex_season.seasonNumber
+        if season_num == 0:
+            continue  # skip specials
+        for plex_ep in plex_season.episodes():
+            ep_num = plex_ep.seasonEpisode  # e.g. S01E03
+            ep_index = plex_ep.index
+            key = (season_num, ep_index)
+
+            sonarr_ep = sonarr_ep_map.get(key)
+            if not sonarr_ep:
+                missing += 1
+                continue
+
+            # Already has a file in Sonarr — skip
+            if sonarr_ep.get("hasFile") or sonarr_ep.get("episodeFileId") in sonarr_ep_files:
+                continue
+
+            # Get file path from Plex
+            try:
+                file_path = plex_ep.media[0].parts[0].file
+            except (IndexError, AttributeError):
+                continue
+
+            # Tell Sonarr about this file via ManualImport command
+            try:
+                payload = {
+                    "name": "ManualImport",
+                    "files": [{
+                        "path": file_path,
+                        "seriesId": sonarr_series_id,
+                        "episodeIds": [sonarr_ep["id"]],
+                        "quality": {"quality": {"id": 4, "name": "HDTV-1080p"}, "revision": {"version": 1}},
+                        "languages": [{"id": 1, "name": "English"}]
+                    }],
+                    "importMode": "auto"
+                }
+                sonarr_post("command", payload)
+                marked += 1
+                logger.debug(f"    ✓ Marked S{season_num:02}E{ep_index:02} of '{title}'")
+            except Exception as e:
+                logger.warning(f"    Could not mark S{season_num:02}E{ep_index:02} of '{title}': {e}")
+
+    return marked, missing
+
+def do_episode_index(plex, sonarr_map):
+    """Index all Plex episodes and mark them as downloaded in Sonarr."""
+    logger.info("📂 Starting episode index pass...")
+    try:
+        tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+        shows = tv_lib.all()
+    except Exception as e:
+        logger.error(f"Could not load Plex library: {e}")
+        return
+
+    total_marked = 0
+    total_missing = 0
+    matched_shows = 0
+
+    for show in shows:
+        tvdb_id = None
+        for guid in show.guids:
+            if "tvdb://" in guid.id:
+                try:
+                    tvdb_id = int(guid.id.replace("tvdb://", ""))
+                except ValueError:
+                    pass
+
+        if not tvdb_id or tvdb_id not in sonarr_map:
+            continue
+
+        sonarr_series = sonarr_map[tvdb_id]
+        logger.info(f"  🔎 Indexing: {show.title}")
+        marked, missing = mark_episodes_downloaded(show, sonarr_series["id"], show.title)
+        total_marked  += marked
+        total_missing += missing
+        matched_shows += 1
+        if marked:
+            logger.info(f"    ✅ Marked {marked} new episodes as downloaded")
+
+    logger.info(f"📂 Episode index complete — {matched_shows} shows checked, {total_marked} episodes marked, {total_missing} not found in Sonarr")
+
+# ── Scan ──────────────────────────────────────────────────────────────────────
+def do_scan():
+    global scan_results, scan_complete, first_run
+    logger.info("🔍 Connecting to Plex...")
+    try:
+        plex = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+        tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+        logger.info(f"📺 Connected to Plex library: {CONFIG['PLEX_TV_LIBRARY']}")
+    except Exception as e:
+        logger.error(f"Plex connection failed: {e}")
+        scan_complete = True
+        return
+
+    logger.info("🔍 Fetching Sonarr series list...")
+    try:
+        sonarr_map = get_sonarr_series_map()
+        quality_profile_id = get_quality_profile_id()
+        logger.info(f"📋 Found {len(sonarr_map)} series in Sonarr")
+    except Exception as e:
+        logger.error(f"Sonarr connection failed: {e}")
+        scan_complete = True
+        return
+
+    shows = tv_lib.all()
+    logger.info(f"📺 Found {len(shows)} shows in Plex — enriching with TMDB...")
+
+    results = []
+    for i, show in enumerate(shows):
+        tvdb_id = None
+        for guid in show.guids:
+            if "tvdb://" in guid.id:
+                try:
+                    tvdb_id = int(guid.id.replace("tvdb://", ""))
+                except ValueError:
+                    pass
+
+        in_sonarr = tvdb_id in sonarr_map if tvdb_id else False
+        tmdb = tmdb_search(show.title, tvdb_id)
+        poster = None
+        if tmdb.get("poster_path"):
+            poster = f"https://image.tmdb.org/t/p/w185{tmdb['poster_path']}"
+        overview = tmdb.get("overview") or show.summary or ""
+        first_air = tmdb.get("first_air_date", "")
+        vote = tmdb.get("vote_average", 0)
+
+        entry = {
+            "id": i,
+            "title": show.title,
+            "tvdbId": tvdb_id,
+            "tmdbId": tmdb.get("id"),
+            "inSonarr": in_sonarr,
+            "poster": poster,
+            "overview": overview[:200] + ("..." if len(overview) > 200 else ""),
+            "firstAir": first_air,
+            "rating": round(vote, 1),
+            "include": not in_sonarr,
+            "qualityProfileId": quality_profile_id,
+            "seasons": len(show.seasons()),
+            "episodes": sum(len(s.episodes()) for s in show.seasons()),
+        }
+        results.append(entry)
+        if (i + 1) % 10 == 0:
+            logger.info(f"  Processed {i+1}/{len(shows)} shows...")
+
+    results.sort(key=lambda x: (x["inSonarr"], x["title"]))
+    scan_results = results
+    scan_complete = True
+    new_count = sum(1 for r in results if not r["inSonarr"])
+    logger.info(f"✅ Scan complete. {len(results)} shows found, {new_count} not in Sonarr.")
+
+def do_watchdog_loop():
+    logger.info(f"🐕 Watchdog loop started (every {CONFIG['POLL_INTERVAL']}s)")
+    while watchdog_running:
+        try:
+            plex = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+            tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+            sonarr_map = get_sonarr_series_map()
+            quality_profile_id = get_quality_profile_id()
+            shows = tv_lib.all()
+            added_new = False
+            for show in shows:
+                tvdb_id = None
+                for guid in show.guids:
+                    if "tvdb://" in guid.id:
+                        try:
+                            tvdb_id = int(guid.id.replace("tvdb://", ""))
+                        except ValueError:
+                            pass
+                if tvdb_id and tvdb_id not in sonarr_map:
+                    logger.info(f"🆕 New show detected: {show.title}")
+                    entry = {"title": show.title, "tvdbId": tvdb_id,
+                             "qualityProfileId": quality_profile_id}
+                    add_series_to_sonarr(entry, quality_profile_id)
+                    added_new = True
+            # Refresh sonarr map and run episode index every pass
+            sonarr_map = get_sonarr_series_map()
+            do_episode_index(plex, sonarr_map)
+            logger.info(f"💤 Sleeping {CONFIG['POLL_INTERVAL']}s...")
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+        time.sleep(CONFIG["POLL_INTERVAL"])
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template("index.html", config=CONFIG)
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    if request.method == "POST":
+        data = request.json
+        for k, v in data.items():
+            if k in CONFIG:
+                CONFIG[k] = v
+        save_config_to_disk(CONFIG)
+        return jsonify({"ok": True})
+    return jsonify(CONFIG)
+
+@app.route("/api/setup", methods=["POST"])
+def api_setup():
+    """Save initial setup config and mark setup complete."""
+    data = request.json
+    for k, v in data.items():
+        if k in CONFIG:
+            CONFIG[k] = v
+    CONFIG["SETUP_COMPLETE"] = True
+    save_config_to_disk(CONFIG)
+    logger.info("✅ Setup complete. Config saved.")
+    return jsonify({"ok": True})
+
+@app.route("/api/test-connections", methods=["POST"])
+def api_test_connections():
+    """Test Plex and Sonarr connections with provided credentials."""
+    data = request.json
+    results = {"plex": False, "sonarr": False, "tmdb": False, "errors": {}}
+    try:
+        plex = PlexServer(data.get("PLEX_URL"), data.get("PLEX_TOKEN"))
+        plex.library.section(data.get("PLEX_TV_LIBRARY", "TV Shows"))
+        results["plex"] = True
+    except Exception as e:
+        results["errors"]["plex"] = str(e)
+    try:
+        r = requests.get(
+            f"{data.get('SONARR_URL')}/api/v3/system/status",
+            headers={"X-Api-Key": data.get("SONARR_API_KEY")}, timeout=8)
+        r.raise_for_status()
+        results["sonarr"] = True
+    except Exception as e:
+        results["errors"]["sonarr"] = str(e)
+    if data.get("TMDB_API_KEY"):
+        try:
+            r = requests.get("https://api.themoviedb.org/3/configuration",
+                             params={"api_key": data.get("TMDB_API_KEY")}, timeout=8)
+            r.raise_for_status()
+            results["tmdb"] = True
+        except Exception as e:
+            results["errors"]["tmdb"] = str(e)
+    return jsonify(results)
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    global scan_complete, scan_approved, scan_results
+    scan_complete = False
+    scan_approved = False
+    scan_results = []
+    logger.info("🚀 Starting Plex scan...")
+    t = threading.Thread(target=do_scan, daemon=True)
+    t.start()
+    return jsonify({"ok": True})
+
+@app.route("/api/scan/status")
+def api_scan_status():
+    return jsonify({
+        "complete": scan_complete,
+        "approved": scan_approved,
+        "count": len(scan_results),
+        "results": scan_results,
+    })
+
+@app.route("/api/approve", methods=["POST"])
+def api_approve():
+    global scan_approved, watchdog_running, watchdog_thread, first_run
+    scan_approved = True
+    data = request.json or {}
+    results = data.get("results", scan_results)
+
+    def do_import():
+        global watchdog_running, watchdog_thread, first_run
+        logger.info("📥 Starting import of approved shows...")
+        quality_profile_id = get_quality_profile_id()
+        to_add = [r for r in results if r.get("include") and not r.get("inSonarr")]
+        logger.info(f"📋 {len(to_add)} shows queued for import")
+        for show in to_add:
+            add_series_to_sonarr(show, quality_profile_id)
+            time.sleep(0.5)
+        logger.info("✅ Series import complete. Now indexing episodes...")
+        time.sleep(3)  # give Sonarr a moment to settle
+        try:
+            plex = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+            sonarr_map = get_sonarr_series_map()
+            do_episode_index(plex, sonarr_map)
+        except Exception as e:
+            logger.error(f"Episode indexing failed: {e}")
+        logger.info("🐕 Starting watchdog loop...")
+        first_run = False
+        watchdog_running = True
+        watchdog_thread = threading.Thread(target=do_watchdog_loop, daemon=True)
+        watchdog_thread.start()
+
+    t = threading.Thread(target=do_import, daemon=True)
+    t.start()
+    return jsonify({"ok": True})
+
+@app.route("/api/episode-index", methods=["POST"])
+def api_episode_index():
+    """Manually trigger an episode index pass."""
+    def run():
+        try:
+            plex = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+            sonarr_map = get_sonarr_series_map()
+            do_episode_index(plex, sonarr_map)
+        except Exception as e:
+            logger.error(f"Manual episode index failed: {e}")
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/api/watchdog/stop", methods=["POST"])
+def api_watchdog_stop():
+    global watchdog_running
+    watchdog_running = False
+    logger.info("🛑 Watchdog stopped.")
+    return jsonify({"ok": True})
+
+@app.route("/api/watchdog/status")
+def api_watchdog_status():
+    return jsonify({"running": watchdog_running, "firstRun": first_run,
+                    "scanComplete": scan_complete, "setupComplete": CONFIG.get("SETUP_COMPLETE", False)})
+
+@app.route("/api/logs/stream")
+def api_logs_stream():
+    def generate():
+        while True:
+            try:
+                entry = log_queue.get(timeout=1)
+                yield f"data: {json.dumps(entry)}\n\n"
+            except queue.Empty:
+                yield f"data: {json.dumps({'ping': True})}\n\n"
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.route("/api/quality-profiles")
+def api_quality_profiles():
+    try:
+        profiles = sonarr_get("qualityprofile")
+        return jsonify(profiles)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
