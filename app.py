@@ -26,6 +26,8 @@ CONFIG_DEFAULTS = {
     "POLL_INTERVAL":          30,
     "SETUP_COMPLETE":         False,
     "INITIAL_SCAN_DONE":      False,
+    "AUTO_LINK":              False,
+    "IGNORED_SERIES":         [],   # tvdbIds the user has deleted and chosen not to re-add
 }
 
 def load_config():
@@ -50,11 +52,13 @@ def save_config_to_disk(cfg):
 CONFIG = load_config()
 
 # ── State ─────────────────────────────────────────────────────────────────────
-log_queue       = queue.Queue()
-log_history     = []
-LOG_HISTORY_MAX = 2000
+log_queue        = queue.Queue()
+log_history      = []
+LOG_HISTORY_MAX  = 2000
 watchdog_running = False
 watchdog_thread  = None
+scan_running     = False
+pending_readd    = []   # shows deleted but found again in Plex, waiting user confirmation
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 class QueueHandler(logging.Handler):
@@ -180,67 +184,109 @@ def add_series_to_sonarr(tvdb_id, title, quality_profile_id, tmdb_id=None):
             logger.error(f"  ❌ Failed to add '{title}': {e}")
         return False
 
-# ── Link episodes ─────────────────────────────────────────────────────────────
-def link_episodes_for_series(plex_show, sonarr_series_id, title):
+# ── Symlink health check ─────────────────────────────────────────────────────
+def check_and_repair_symlinks(sonarr_map):
     """
-    Cross-reference Plex episodes against Sonarr and mark files as downloaded.
-    Returns (newly_marked, already_had, not_in_sonarr).
+    Walk every Sonarr series folder, find symlinks, and verify they point
+    to a real file. Broken ones are removed so they can be recreated on the
+    next symlink pass.
     """
-    try:
-        sonarr_episodes = sonarr_get(f"episode?seriesId={sonarr_series_id}")
-        existing_file_ids = {ef["id"] for ef in sonarr_get(f"episodefile?seriesId={sonarr_series_id}")}
-    except Exception as e:
-        logger.error(f"  ❌ Could not fetch Sonarr episodes for '{title}': {e}")
-        return 0, 0, 0
+    repaired = 0
+    removed  = 0
+    for tvdb_id, series in sonarr_map.items():
+        path = series.get("path", "")
+        if not path or not os.path.isdir(path):
+            continue
+        for root, dirs, files in os.walk(path):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                if os.path.islink(fpath):
+                    target = os.readlink(fpath)
+                    if not os.path.exists(fpath):
+                        # Broken symlink — remove it
+                        try:
+                            os.remove(fpath)
+                            removed += 1
+                            logger.info(f"  🔧 Removed broken symlink: {fname} → {target}")
+                        except Exception as e:
+                            logger.warning(f"  ⚠ Could not remove broken symlink {fname}: {e}")
+    if removed:
+        logger.info(f"🔧 Symlink health check — {removed} broken symlinks removed")
+    else:
+        logger.debug("🔧 Symlink health check — all symlinks OK")
+    return removed
 
-    ep_map = {}
-    for ep in sonarr_episodes:
-        ep_map[(ep["seasonNumber"], ep["episodeNumber"])] = ep
+# ── Symlink + Rescan ──────────────────────────────────────────────────────────
+def symlink_series(plex_show, sonarr_series):
+    """
+    For each episode in Plex, create a symlink inside the Sonarr series folder
+    so Sonarr can find and mark the file as downloaded on rescan.
+    """
+    title        = sonarr_series["title"]
+    series_path  = sonarr_series.get("path", "")
+    if not series_path:
+        logger.warning(f"  ⚠ No path set in Sonarr for '{title}' — skipping symlink")
+        return 0
 
-    newly_marked = 0
-    already_had  = 0
-    not_in_sonarr = 0
+    created = 0
+    skipped = 0
 
     for plex_season in plex_show.seasons():
         snum = plex_season.seasonNumber
         if snum == 0:
             continue
+        season_dir = os.path.join(series_path, f"Season {snum:02}")
+        os.makedirs(season_dir, exist_ok=True)
+
         for plex_ep in plex_season.episodes():
-            enum = plex_ep.index
-            sonarr_ep = ep_map.get((snum, enum))
-            if not sonarr_ep:
-                not_in_sonarr += 1
-                continue
-            if sonarr_ep.get("hasFile") or sonarr_ep.get("episodeFileId") in existing_file_ids:
-                already_had += 1
-                continue
             try:
-                file_path = plex_ep.media[0].parts[0].file
+                src = plex_ep.media[0].parts[0].file
             except (IndexError, AttributeError):
                 continue
+
+            filename = os.path.basename(src)
+            dst = os.path.join(season_dir, filename)
+
+            # If symlink exists and is valid — skip
+            if os.path.islink(dst) and os.path.exists(dst):
+                skipped += 1
+                continue
+
+            # If symlink is broken — remove and recreate
+            if os.path.islink(dst) and not os.path.exists(dst):
+                logger.info(f"    🔧 Repairing broken symlink S{snum:02}E{plex_ep.index:02}")
+                os.remove(dst)
+
+            # If a real file already exists there — skip
+            if os.path.exists(dst):
+                skipped += 1
+                continue
+
             try:
-                sonarr_post("command", {
-                    "name": "ManualImport",
-                    "files": [{
-                        "path":       file_path,
-                        "seriesId":   sonarr_series_id,
-                        "episodeIds": [sonarr_ep["id"]],
-                        "quality":    {"quality": {"id": 4, "name": "HDTV-1080p"}, "revision": {"version": 1}},
-                        "languages":  [{"id": 1, "name": "English"}],
-                    }],
-                    "importMode": "auto",
-                })
-                newly_marked += 1
-                logger.info(f"    🔗 Linked S{snum:02}E{enum:02} — {os.path.basename(file_path)}")
+                os.symlink(src, dst)
+                created += 1
+                logger.debug(f"    🔗 Symlinked S{snum:02}E{plex_ep.index:02} → {dst}")
             except Exception as e:
-                logger.warning(f"    ⚠ Could not link S{snum:02}E{enum:02}: {e}")
+                logger.warning(f"    ⚠ Symlink failed for S{snum:02}E{plex_ep.index:02}: {e}")
 
-    return newly_marked, already_had, not_in_sonarr
+    if created:
+        logger.info(f"  🔗 '{title}' — {created} symlinks created, {skipped} already existed")
+    return created
 
-def link_all_series(plex, sonarr_map):
-    """Link episodes for all series in Sonarr from Plex."""
-    logger.info("🔗 Starting episode link pass for all series...")
-    tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+def rescan_series(sonarr_series_id, title):
+    """Tell Sonarr to rescan disk for a series."""
+    try:
+        sonarr_post("command", {"name": "RescanSeries", "seriesId": sonarr_series_id})
+        logger.info(f"  🔍 Rescan triggered for '{title}'")
+        return True
+    except Exception as e:
+        logger.warning(f"  ⚠ Rescan failed for '{title}': {e}")
+        return False
+
+def symlink_and_rescan_all(plex, sonarr_map):
+    """Symlink Plex files into Sonarr folders then trigger rescan."""
+    logger.info("🔗 Starting symlink pass...")
+    tv_lib    = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
     total_new = 0
     for show in tv_lib.all():
         tvdb_id = None
@@ -251,22 +297,36 @@ def link_all_series(plex, sonarr_map):
         if not tvdb_id or tvdb_id not in sonarr_map:
             continue
         sonarr_series = sonarr_map[tvdb_id]
-        new, had, missing = link_episodes_for_series(show, sonarr_series["id"], show.title)
-        total_new += new
-        if new:
-            logger.info(f"  📺 '{show.title}' — {new} newly linked, {had} already linked")
-    logger.info(f"🔗 Link pass complete — {total_new} episodes newly linked across all series")
+        created = symlink_series(show, sonarr_series)
+        total_new += created
+        if created:
+            rescan_series(sonarr_series["id"], sonarr_series["title"])
+            time.sleep(0.3)
+    logger.info(f"✅ Symlink pass complete — {total_new} new symlinks created")
+
+def rescan_all_series(sonarr_map):
+    """Trigger disk rescan for all series without symlinking."""
+    logger.info("🔍 Triggering rescan for all series...")
+    for tvdb_id, series in sonarr_map.items():
+        rescan_series(series["id"], series["title"])
+        time.sleep(0.2)
+    logger.info(f"✅ Rescan triggered for {len(sonarr_map)} series")
 
 # ── Initial Plex scan ─────────────────────────────────────────────────────────
 def do_initial_scan():
     """Scan Plex, add only continuing shows to Sonarr, then start watchdog."""
-    global watchdog_running, watchdog_thread
+    global watchdog_running, watchdog_thread, scan_running
+    if scan_running:
+        logger.warning("⚠ Scan already in progress — ignoring duplicate request")
+        return
+    scan_running = True
     logger.info("🔍 Starting initial Plex scan...")
     try:
         plex   = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
         tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
     except Exception as e:
         logger.error(f"❌ Plex connection failed: {e}")
+        scan_running = False
         return
 
     try:
@@ -274,6 +334,7 @@ def do_initial_scan():
         quality_profile_id = get_quality_profile_id()
     except Exception as e:
         logger.error(f"❌ Sonarr connection failed: {e}")
+        scan_running = False
         return
 
     shows = tv_lib.all()
@@ -301,6 +362,10 @@ def do_initial_scan():
             skipped_ended += 1
             continue
 
+        if tvdb_id in CONFIG.get("IGNORED_SERIES", []):
+            logger.debug(f"  ⏭ '{show.title}' is in ignore list — skipping")
+            continue
+
         logger.info(f"  📡 Adding continuing show: {show.title} [{status}]")
         add_series_to_sonarr(tvdb_id, show.title, quality_profile_id)
         added += 1
@@ -309,12 +374,16 @@ def do_initial_scan():
     logger.info(f"✅ Initial scan done — {added} added, {skipped_exists} already in Sonarr, {skipped_ended} ended/skipped")
 
     # Link episodes for all added series
-    logger.info("🔗 Linking episodes for all series...")
-    sonarr_map = get_sonarr_series_map()
-    link_all_series(plex, sonarr_map)
+    if CONFIG.get("AUTO_LINK", True):
+        logger.info("🔗 Linking episodes for all series...")
+        sonarr_map = get_sonarr_series_map()
+        rescan_all_series(sonarr_map)
+    else:
+        logger.info("⏭ Auto-link is disabled — skipping episode linking")
 
     CONFIG["INITIAL_SCAN_DONE"] = True
     save_config_to_disk(CONFIG)
+    scan_running = False
     logger.info("🐕 Starting watchdog loop...")
     watchdog_running = True
     watchdog_thread  = threading.Thread(target=do_watchdog_loop, daemon=True)
@@ -347,12 +416,31 @@ def do_watchdog_loop():
                 is_ongoing, status = get_show_status(tvdb_id, show.title)
                 if not is_ongoing:
                     continue
+                # Check if user previously deleted this series
+                if tvdb_id in CONFIG.get("IGNORED_SERIES", []):
+                    already_pending = any(p["tvdbId"] == tvdb_id for p in pending_readd)
+                    if not already_pending:
+                        logger.info(f"⚠ '{show.title}' was previously deleted — awaiting user confirmation to re-add")
+                        pending_readd.append({"tvdbId": tvdb_id, "title": show.title, "status": status})
+                    continue
                 logger.info(f"🆕 New continuing show in Plex: {show.title} [{status}]")
                 add_series_to_sonarr(tvdb_id, show.title, quality_profile_id)
 
-            # Step 2: link new episodes for all series
+            # Step 2: always check and repair broken symlinks
             sonarr_map = get_sonarr_series_map()
-            link_all_series(plex, sonarr_map)
+            broken = check_and_repair_symlinks(sonarr_map)
+
+            # Step 3: if auto-link on, symlink new files and rescan
+            if CONFIG.get("AUTO_LINK", True):
+                symlink_and_rescan_all(plex, sonarr_map)
+            elif broken:
+                # Even if auto-link is off, rescan series where symlinks were repaired
+                logger.info("🔍 Rescanning series with repaired symlinks...")
+                for tvdb_id, series in sonarr_map.items():
+                    path = series.get("path", "")
+                    if path and os.path.isdir(path):
+                        rescan_series(series["id"], series["title"])
+                        time.sleep(0.2)
 
         except Exception as e:
             logger.error(f"Watchdog error: {e}")
@@ -386,8 +474,9 @@ def auto_start():
             add_series_to_sonarr(tvdb_id, show.title, quality_profile_id)
             added += 1
             time.sleep(0.3)
-        sonarr_map = get_sonarr_series_map()
-        link_all_series(plex, sonarr_map)
+        if CONFIG.get("AUTO_LINK", True):
+            sonarr_map = get_sonarr_series_map()
+            symlink_and_rescan_all(plex, sonarr_map)
         logger.info(f"✅ Auto-start complete — {added} new shows added")
     except Exception as e:
         logger.error(f"Auto-start error: {e}")
@@ -461,6 +550,7 @@ def api_status():
         "setupComplete":    CONFIG.get("SETUP_COMPLETE", False),
         "initialScanDone":  CONFIG.get("INITIAL_SCAN_DONE", False),
         "watchdogRunning":  watchdog_running,
+        "scanRunning":      scan_running,
     })
 
 @app.route("/api/series/list")
@@ -488,13 +578,13 @@ def api_series_list():
 
 @app.route("/api/series/<int:sonarr_id>/link", methods=["POST"])
 def api_series_link(sonarr_id):
-    """Link Plex episodes for a single Sonarr series."""
+    """Symlink Plex files into Sonarr folder then trigger rescan."""
     def run():
         try:
             series  = sonarr_get(f"series/{sonarr_id}")
             title   = series["title"]
             tvdb_id = series.get("tvdbId")
-            logger.info(f"🔗 Manually linking episodes for: {title}")
+            logger.info(f"🔗 Symlinking files for: {title}")
             plex   = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
             tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
             plex_show = None
@@ -502,32 +592,96 @@ def api_series_link(sonarr_id):
                 for guid in show.guids:
                     if "tvdb://" in guid.id:
                         try:
-                            if int(guid.id.replace("tvdb://","")) == tvdb_id:
+                            if int(guid.id.replace("tvdb://", "")) == tvdb_id:
                                 plex_show = show; break
                         except ValueError: pass
                 if plex_show: break
             if not plex_show:
                 logger.warning(f"  ⚠ '{title}' not found in Plex")
                 return
-            new, had, missing = link_episodes_for_series(plex_show, sonarr_id, title)
-            logger.info(f"  ✅ '{title}' — {new} newly linked, {had} already linked, {missing} not in Sonarr")
+            symlink_series(plex_show, series)
+            rescan_series(sonarr_id, title)
         except Exception as e:
-            logger.error(f"Link failed for series {sonarr_id}: {e}")
+            logger.error(f"Symlink/rescan failed for series {sonarr_id}: {e}")
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/api/series/link-all", methods=["POST"])
 def api_series_link_all():
-    """Link episodes for every series in Sonarr."""
+    """Symlink all Plex files into Sonarr folders then rescan."""
     def run():
         try:
-            logger.info("🔗 Bulk link — linking all series...")
             plex       = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
             sonarr_map = get_sonarr_series_map()
-            link_all_series(plex, sonarr_map)
+            symlink_and_rescan_all(plex, sonarr_map)
         except Exception as e:
-            logger.error(f"Bulk link failed: {e}")
+            logger.error(f"Bulk symlink failed: {e}")
     threading.Thread(target=run, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/api/series/<int:sonarr_id>/delete", methods=["POST"])
+def api_series_delete(sonarr_id):
+    """Delete a series from Sonarr and add its tvdbId to the ignored list."""
+    try:
+        series  = sonarr_get(f"series/{sonarr_id}")
+        tvdb_id = series.get("tvdbId")
+        title   = series["title"]
+        # Delete from Sonarr (deleteFiles=False — don't touch actual files/symlinks)
+        requests.delete(
+            f"{CONFIG['SONARR_URL']}/api/v3/series/{sonarr_id}",
+            headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]},
+            params={"deleteFiles": "false", "addImportListExclusion": "false"},
+            timeout=10
+        ).raise_for_status()
+        # Add to ignored list
+        ignored = CONFIG.get("IGNORED_SERIES", [])
+        if tvdb_id and tvdb_id not in ignored:
+            ignored.append(tvdb_id)
+            CONFIG["IGNORED_SERIES"] = ignored
+            save_config_to_disk(CONFIG)
+        logger.info(f"🗑 Deleted '{title}' from Sonarr and added to ignore list (TVDB:{tvdb_id})")
+        return jsonify({"ok": True, "title": title})
+    except Exception as e:
+        logger.error(f"Delete failed for series {sonarr_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/pending-readd", methods=["GET"])
+def api_pending_readd():
+    return jsonify(pending_readd)
+
+@app.route("/api/pending-readd/confirm", methods=["POST"])
+def api_pending_readd_confirm():
+    """User confirms re-adding a previously deleted series."""
+    global pending_readd
+    data    = request.json or {}
+    tvdb_id = data.get("tvdbId")
+    title   = data.get("title", "")
+    # Remove from ignored list
+    ignored = CONFIG.get("IGNORED_SERIES", [])
+    if tvdb_id in ignored:
+        ignored.remove(tvdb_id)
+        CONFIG["IGNORED_SERIES"] = ignored
+        save_config_to_disk(CONFIG)
+    # Remove from pending
+    pending_readd = [p for p in pending_readd if p["tvdbId"] != tvdb_id]
+    # Add to Sonarr
+    try:
+        qp_id = get_quality_profile_id()
+        add_series_to_sonarr(tvdb_id, title, qp_id)
+        logger.info(f"✅ Re-added '{title}' to Sonarr after user confirmation")
+    except Exception as e:
+        logger.error(f"Re-add failed for '{title}': {e}")
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True})
+
+@app.route("/api/pending-readd/dismiss", methods=["POST"])
+def api_pending_readd_dismiss():
+    """User dismisses re-add prompt — keeps series ignored."""
+    global pending_readd
+    data    = request.json or {}
+    tvdb_id = data.get("tvdbId")
+    pending_readd = [p for p in pending_readd if p["tvdbId"] != tvdb_id]
+    logger.info(f"⏭ Dismissed re-add prompt for TVDB:{tvdb_id}")
     return jsonify({"ok": True})
 
 @app.route("/api/watchdog/stop", methods=["POST"])
