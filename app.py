@@ -6,10 +6,648 @@ import json
 import queue
 import requests
 from datetime import datetime
-from flask import Flask, render_template, jsonify, request, Response, stream_with_context
+from flask import Flask, jsonify, request, Response, stream_with_context
 from plexapi.server import PlexServer
 
 app = Flask(__name__)
+
+# ── Embedded template (no templates/ folder needed) ───────────────────────────
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Watchdog</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0b0d;--surface:#111318;--border:#1e2129;--border2:#2a2f3a;--accent:#e8ff47;--accent2:#47b8ff;--danger:#ff4757;--success:#2ed573;--muted:#4a5165;--text:#c8cdd8;--hi:#f0f2f7}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh;display:flex;flex-direction:column}
+
+/* ── SETUP ── */
+#setup-overlay{display:none;position:fixed;inset:0;background:var(--bg);z-index:500;overflow-y:auto;padding:40px 20px;align-items:flex-start;justify-content:center}
+#setup-overlay.show{display:flex}
+.setup-card{width:100%;max-width:640px;margin:auto}
+.setup-logo{text-align:center;margin-bottom:40px}
+.setup-logo .icon{font-size:56px;display:block;margin-bottom:12px}
+.setup-logo h1{font-size:36px;font-weight:800;color:var(--hi);letter-spacing:-1px}
+.setup-logo p{color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:12px;margin-top:6px;letter-spacing:1px}
+.setup-steps{display:flex;margin-bottom:32px;border-bottom:1px solid var(--border)}
+.sst{flex:1;padding:12px;text-align:center;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);border-bottom:2px solid transparent;transition:all .2s;letter-spacing:1px}
+.sst.active{color:var(--accent);border-bottom-color:var(--accent)}
+.sst.done{color:var(--success)}
+.spage{display:none}.spage.active{display:block}
+.stitle{font-size:18px;font-weight:800;color:var(--hi);margin-bottom:6px}
+.ssub{font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.5}
+.ssub a{color:var(--accent2);text-decoration:none}
+.fg{margin-bottom:16px}
+.fg label{display:block;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px}
+.fg input{width:100%;background:var(--surface);border:1px solid var(--border2);border-radius:8px;color:var(--hi);font-family:'JetBrains Mono',monospace;font-size:13px;padding:11px 14px;outline:none;transition:border-color .15s}
+.fg input:focus{border-color:var(--accent)}
+.fhint{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);margin-top:5px}
+.frow{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.test-btn{font-family:'Syne',sans-serif;font-weight:700;font-size:12px;padding:10px 18px;border-radius:8px;border:1px solid var(--border2);background:transparent;color:var(--text);cursor:pointer;transition:all .15s;margin-top:8px}
+.test-btn:hover{border-color:var(--accent2);color:var(--accent2)}
+.test-result{font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:10px;padding:10px 14px;border-radius:6px;display:none}
+.test-result.show{display:block}
+.test-result.ok{background:rgba(46,213,115,.1);border:1px solid var(--success);color:var(--success)}
+.test-result.fail{background:rgba(255,71,87,.1);border:1px solid var(--danger);color:var(--danger)}
+.snav{display:flex;justify-content:space-between;margin-top:32px;padding-top:24px;border-top:1px solid var(--border);gap:12px}
+
+/* ── BUTTONS ── */
+.btn{font-family:'Syne',sans-serif;font-weight:700;font-size:13px;padding:10px 22px;border-radius:8px;border:none;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--accent);color:#000}.btn-primary:hover{background:#f0ff60;transform:translateY(-1px)}
+.btn-secondary{background:transparent;color:var(--text);border:1px solid var(--border2)}.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
+.btn-success{background:var(--success);color:#000}.btn-success:hover{background:#3dff87}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-sm{font-size:11px;padding:6px 14px}
+.btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important}
+
+/* ── LOADING ── */
+#loading{display:none;position:fixed;inset:0;background:rgba(10,11,13,.88);z-index:300;align-items:center;justify-content:center;flex-direction:column;gap:16px;backdrop-filter:blur(6px)}
+#loading.show{display:flex}
+.spinner{width:48px;height:48px;border:3px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--accent);letter-spacing:1px}
+.loading-sub{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)}
+
+/* ── APP SHELL ── */
+#app{display:none;flex-direction:column;flex:1}
+
+/* header */
+header{display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:58px;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(10,11,13,.96);backdrop-filter:blur(12px);z-index:100;flex-shrink:0}
+.logo{display:flex;align-items:center;gap:10px}
+.logo-icon{width:34px;height:34px;background:var(--accent);border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+.logo-text{font-size:20px;font-weight:800;color:var(--hi);letter-spacing:-.5px}
+.logo-sub{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:2px}
+.header-mid{display:flex;gap:2px}
+.nav-tab{font-family:'JetBrains Mono',monospace;font-size:11px;padding:7px 16px;border-radius:6px;border:none;background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;letter-spacing:.5px}
+.nav-tab:hover{color:var(--text)}
+.nav-tab.active{background:rgba(232,255,71,.08);color:var(--accent)}
+.header-right{display:flex;align-items:center;gap:10px}
+.status-pill{font-family:'JetBrains Mono',monospace;font-size:11px;padding:5px 12px;border-radius:20px;border:1px solid var(--border2);color:var(--muted);display:flex;align-items:center;gap:6px}
+.status-pill.running{border-color:var(--success);color:var(--success)}
+.status-pill.scanning{border-color:var(--accent);color:var(--accent)}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.dot.pulse{animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+
+/* ── PAGES ── */
+.page{display:none;flex:1;flex-direction:column;min-height:0}
+.page.active{display:flex}
+
+/* ── PAGE 1: DASHBOARD ── */
+#page-dashboard{overflow-y:auto}
+
+/* scanning progress bar shown before watchdog starts */
+#scan-progress{padding:20px 28px;border-bottom:1px solid var(--border);background:var(--surface);display:none}
+.scan-status-row{display:flex;align-items:center;gap:16px;margin-bottom:12px}
+.scan-status-text{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent);flex:1}
+.progress-track{height:4px;background:var(--border2);border-radius:2px;overflow:hidden}
+.progress-fill{height:100%;background:var(--accent);border-radius:2px;transition:width .4s;width:0%}
+
+/* console */
+.console-wrap{display:flex;flex-direction:column;margin:20px 28px;border:1px solid var(--border2);border-radius:10px;overflow:hidden;background:#080a0c}
+.console-bar{display:flex;align-items:center;gap:10px;padding:10px 18px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
+.cdots{display:flex;gap:5px}
+.cdot{width:10px;height:10px;border-radius:50%}
+.cdot.r{background:#ff5f57}.cdot.y{background:#febc2e}.cdot.g{background:#28c840}
+.ctitle{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);flex:1;text-align:center;letter-spacing:1px}
+.cclear{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);background:none;border:none;cursor:pointer;padding:2px 8px}
+.cclear:hover{color:var(--accent)}
+#console-out{padding:10px 18px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.7}
+#console-out::-webkit-scrollbar{width:4px}
+#console-out::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+.ll{display:flex;gap:10px}
+.lt{color:var(--muted);flex-shrink:0}
+.lv{flex-shrink:0;width:52px;text-align:right}
+.lv.INFO{color:var(--accent2)}.lv.WARNING{color:#ffa502}.lv.ERROR{color:var(--danger)}.lv.DEBUG{color:var(--muted)}
+.lm{color:var(--text);word-break:break-all}
+
+/* ── PAGE 2: SERIES ── */
+#page-series{overflow:hidden}
+.series-toolbar{display:flex;align-items:center;gap:10px;padding:16px 28px;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap}
+.series-search{background:var(--surface);border:1px solid var(--border2);border-radius:6px;color:var(--hi);font-family:'JetBrains Mono',monospace;font-size:12px;padding:8px 14px;outline:none;flex:1;min-width:180px;transition:border-color .15s}
+.series-search:focus{border-color:var(--accent)}
+.sf-tabs{display:flex;gap:4px}
+.sf-tab{font-family:'JetBrains Mono',monospace;font-size:10px;padding:6px 12px;border-radius:6px;border:1px solid var(--border2);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s}
+.sf-tab.active{border-color:var(--accent);color:var(--accent);background:rgba(232,255,71,.07)}
+
+.series-list-wrap{flex:1;overflow-y:auto;padding:20px 28px}
+#series-list{display:flex;flex-direction:column;gap:8px}
+.sr{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:10px;border:1px solid var(--border);background:var(--surface);transition:border-color .15s;cursor:pointer}
+.sr:hover{border-color:var(--border2)}
+.sr-poster{width:40px;height:58px;border-radius:5px;object-fit:cover;background:var(--border);flex-shrink:0}
+.sr-poster-ph{width:40px;height:58px;border-radius:5px;background:var(--border);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+.sr-info{flex:1;min-width:0}
+.sr-title{font-weight:700;font-size:14px;color:var(--hi);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:6px}
+.sr-bar-wrap{display:flex;align-items:center;gap:8px}
+.sr-bar{flex:1;height:3px;border-radius:2px;background:var(--border2);overflow:hidden}
+.sr-bar-fill{height:100%;background:var(--success);border-radius:2px;transition:width .4s}
+.sr-eps{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);flex-shrink:0;min-width:60px;text-align:right}
+.sr-pill{font-family:'JetBrains Mono',monospace;font-size:9px;padding:2px 8px;border-radius:4px;letter-spacing:1px;flex-shrink:0}
+.sr-pill.ongoing{background:rgba(71,184,255,.12);border:1px solid var(--accent2);color:var(--accent2)}
+.sr-pill.ended{background:rgba(74,81,101,.2);border:1px solid var(--muted);color:var(--muted)}
+.link-btn{font-family:'Syne',sans-serif;font-weight:700;font-size:11px;padding:7px 16px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;transition:all .15s;flex-shrink:0;white-space:nowrap}
+.link-btn:hover:not(:disabled){background:var(--accent);color:#000}
+.link-btn:disabled{opacity:.4;cursor:not-allowed}
+.link-btn.done{border-color:var(--success);color:var(--success)}
+.link-btn.done:hover:not(:disabled){background:var(--success);color:#000}
+
+/* config panel */
+#cfg-panel{padding:20px 28px;border-bottom:1px solid var(--border);background:var(--surface);display:none}
+.cfg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin-top:14px}
+.cff label{display:block;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:5px}
+.cff input{width:100%;background:var(--bg);border:1px solid var(--border2);border-radius:6px;color:var(--hi);font-family:'JetBrains Mono',monospace;font-size:12px;padding:8px 12px;outline:none;transition:border-color .15s}
+.cff input:focus{border-color:var(--accent)}
+
+/* ── MODAL ── */
+#modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:400;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+#modal-overlay.show{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border2);border-radius:12px;padding:28px;width:100%;max-width:420px;margin:20px}
+.modal-title{font-size:17px;font-weight:800;color:var(--hi);margin-bottom:8px}
+.modal-body{font-size:13px;color:var(--text);line-height:1.6;margin-bottom:24px}
+.modal-body strong{color:var(--accent)}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+
+/* ── PENDING READD BANNER ── */
+#readd-banner{display:none;background:rgba(255,71,87,.08);border-bottom:1px solid var(--danger);padding:10px 28px}
+.readd-item{display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid rgba(255,71,87,.15)}
+.readd-item:last-child{border-bottom:none}
+.readd-title{flex:1;font-size:13px;font-weight:700;color:var(--hi)}
+.readd-sub{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--danger);margin-top:2px}
+</style>
+</head>
+<body>
+
+<!-- SETUP -->
+<div id="setup-overlay">
+<div class="setup-card">
+  <div class="setup-logo"><span class="icon">🐕</span><h1>Watchdog</h1><p>PLEX → SONARR BRIDGE · SETUP</p></div>
+  <div class="setup-steps">
+    <div class="sst active" id="t1">1 · PLEX</div>
+    <div class="sst" id="t2">2 · SONARR</div>
+    <div class="sst" id="t3">3 · TMDB</div>
+    <div class="sst" id="t4">4 · DONE</div>
+  </div>
+  <div class="spage active" id="sp1">
+    <div class="stitle">Plex Connection</div>
+    <div class="ssub">Your Plex server URL and token. Find token at <a href="https://support.plex.tv/articles/204059436" target="_blank">support.plex.tv</a>.</div>
+    <div class="fg"><label>Plex URL</label><input id="s-pu" placeholder="http://192.168.1.x:32400" value="{{ config.PLEX_URL }}"><div class="fhint">Include http:// and port 32400</div></div>
+    <div class="fg"><label>Plex Token</label><input type="password" id="s-pt" value="{{ config.PLEX_TOKEN }}"></div>
+    <div class="fg"><label>TV Library Name</label><input id="s-pl" placeholder="TV Shows" value="{{ config.PLEX_TV_LIBRARY }}"><div class="fhint">Must match exactly as it appears in Plex</div></div>
+    <button class="test-btn" onclick="testConn('plex')">🔌 Test Plex Connection</button>
+    <div class="test-result" id="tr-plex"></div>
+    <div class="snav"><div></div><button class="btn btn-primary" onclick="goPage(2)">Next → Sonarr</button></div>
+  </div>
+  <div class="spage" id="sp2">
+    <div class="stitle">Sonarr Connection</div>
+    <div class="ssub">API key in Sonarr → Settings → General → Security.</div>
+    <div class="fg"><label>Sonarr URL</label><input id="s-su" placeholder="http://192.168.1.x:8989" value="{{ config.SONARR_URL }}"></div>
+    <div class="fg"><label>Sonarr API Key</label><input type="password" id="s-sk" value="{{ config.SONARR_API_KEY }}"></div>
+    <div class="frow">
+      <div class="fg"><label>Root Folder</label><input id="s-rf" placeholder="/tv" value="{{ config.SONARR_ROOT_FOLDER }}"></div>
+      <div class="fg"><label>Quality Profile</label><input id="s-qp" placeholder="HD-1080p" value="{{ config.SONARR_QUALITY_PROFILE }}"></div>
+    </div>
+    <div class="fg"><label>Poll Interval (seconds)</label><input type="number" id="s-pi" value="{{ config.POLL_INTERVAL }}"></div>
+    <button class="test-btn" onclick="testConn('sonarr')">🔌 Test Sonarr Connection</button>
+    <div class="test-result" id="tr-sonarr"></div>
+    <div class="snav"><button class="btn btn-secondary" onclick="goPage(1)">← Back</button><button class="btn btn-primary" onclick="goPage(3)">Next → TMDB</button></div>
+  </div>
+  <div class="spage" id="sp3">
+    <div class="stitle">TMDB (Optional but recommended)</div>
+    <div class="ssub">Used to determine if a show is still ongoing. Free key at <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a>.</div>
+    <div class="fg"><label>TMDB API Key</label><input type="password" id="s-tm" value="{{ config.TMDB_API_KEY }}"></div>
+    <button class="test-btn" onclick="testConn('tmdb')">🔌 Test TMDB Key</button>
+    <div class="test-result" id="tr-tmdb"></div>
+    <div class="snav"><button class="btn btn-secondary" onclick="goPage(2)">← Back</button><button class="btn btn-primary" onclick="saveSetup()">Save & Start →</button></div>
+  </div>
+  <div class="spage" id="sp4">
+    <div style="text-align:center;padding:40px 0">
+      <div style="font-size:64px;margin-bottom:20px">✅</div>
+      <div class="stitle" style="font-size:24px;margin-bottom:10px">All Set!</div>
+      <div class="ssub">Watchdog will now scan your Plex library and add all continuing shows to Sonarr.</div>
+      <button class="btn btn-success" style="margin-top:24px;padding:14px 36px;font-size:15px" onclick="launchApp()">🚀 Start Scanning</button>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- LOADING -->
+<div id="loading"><div class="spinner"></div><div class="loading-title" id="lt">PLEASE WAIT</div><div class="loading-sub" id="ls"></div></div>
+
+<!-- APP -->
+<div id="app">
+  <header>
+    <div class="logo">
+      <div class="logo-icon">🐕</div>
+      <div><div class="logo-text">Watchdog</div><div class="logo-sub">PLEX → SONARR</div></div>
+    </div>
+    <div class="header-mid">
+      <button class="nav-tab active" onclick="showPage('dashboard',this)">📡 Dashboard</button>
+      <button class="nav-tab" onclick="showPage('series',this);loadSeries()">📺 Series</button>
+    </div>
+    <div class="header-right">
+      <div class="status-pill" id="status-pill"><div class="dot"></div> IDLE</div>
+      <button class="btn btn-secondary btn-sm" onclick="toggleCfg()">⚙ Config</button>
+      <button class="btn btn-secondary btn-sm" id="stop-btn" style="display:none" onclick="stopWatchdog()">■ Stop</button>
+    </div>
+  </header>
+
+  <!-- config panel -->
+  <div id="cfg-panel">
+    <div style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:2px">Configuration</div>
+    <div class="cfg-grid">
+      <div class="cff"><label>Plex URL</label><input id="c-pu"></div>
+      <div class="cff"><label>Plex Token</label><input type="password" id="c-pt"></div>
+      <div class="cff"><label>TV Library</label><input id="c-pl"></div>
+      <div class="cff"><label>Sonarr URL</label><input id="c-su"></div>
+      <div class="cff"><label>Sonarr API Key</label><input type="password" id="c-sk"></div>
+      <div class="cff"><label>Root Folder</label><input id="c-rf"></div>
+      <div class="cff"><label>Quality Profile</label><input id="c-qp"></div>
+      <div class="cff"><label>TMDB Key</label><input type="password" id="c-tm"></div>
+      <div class="cff"><label>Poll Interval (s)</label><input type="number" id="c-pi"></div>
+      <div class="cff" style="display:flex;flex-direction:column;justify-content:flex-end">
+        <label>Auto Link Episodes</label>
+        <label style="display:flex;align-items:center;gap:10px;padding:8px 0;cursor:pointer">
+          <input type="checkbox" id="c-al" style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text)">Link episodes automatically on each scan</span>
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:10px">
+      <button class="btn btn-primary btn-sm" onclick="saveCfg()">Save</button>
+      <button class="btn btn-secondary btn-sm" onclick="toggleCfg()">Cancel</button>
+    </div>
+  </div>
+
+  <!-- PAGE 1: Dashboard -->
+  <div class="page active" id="page-dashboard">
+    <div id="scan-progress">
+      <div class="scan-status-row">
+        <div class="scan-status-text" id="scan-status-text">🔍 Scanning Plex library...</div>
+      </div>
+      <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+    </div>
+    <div class="console-wrap">
+      <div class="console-bar">
+        <div class="cdots"><div class="cdot r"></div><div class="cdot y"></div><div class="cdot g"></div></div>
+        <div class="ctitle">watchdog.log — live</div>
+        <button class="cclear" onclick="clearLog()">clear</button>
+      </div>
+      <div id="console-out"></div>
+    </div>
+  </div>
+
+  <!-- PAGE 2: Series -->
+  <div class="page" id="page-series">
+    <div class="series-toolbar">
+      <input class="series-search" id="series-search" placeholder="Search series..." oninput="filterSeries()">
+      <div class="sf-tabs">
+        <button class="sf-tab active" onclick="setSF('all',this)">All</button>
+        <button class="sf-tab" onclick="setSF('ongoing',this)">Ongoing</button>
+        <button class="sf-tab" onclick="setSF('ended',this)">Ended</button>
+        <button class="sf-tab" onclick="setSF('pending',this)">Pending</button>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="loadSeries()">↻ Refresh</button>
+      <button class="btn btn-primary btn-sm" onclick="linkAll()">🔍 Rescan All</button>
+    </div>
+    <div class="series-list-wrap"><div id="series-list"></div></div>
+  </div>
+</div>
+
+<!-- RE-ADD BANNER -->
+<div id="readd-banner"></div>
+
+<!-- DELETE CONFIRM MODAL -->
+<div id="modal-overlay">
+  <div class="modal">
+    <div class="modal-title">Delete Series?</div>
+    <div class="modal-body">Remove <strong id="modal-series-title"></strong> from Sonarr?<br><br>
+    If this show appears in Plex again, you'll be asked before it's re-added.</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-sm" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger btn-sm" onclick="doDelete()">Delete</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let allSeries=[], seriesFilter='all', logStreamStarted=false;
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+(async()=>{
+  try{
+    const r=await fetch('/api/status');
+    if(!r.ok){document.body.innerHTML='<div style="color:#ff4757;font-family:monospace;padding:40px">API error: '+r.status+'</div>';return}
+    const d=await r.json();
+    if(!d.setupComplete){
+      document.getElementById('setup-overlay').classList.add('show');
+      return;
+    }
+    showApp();
+    await replayLogs();
+    startLogStream();
+    if(d.initialScanDone){
+      setPill('running','🐕 RUNNING');
+      document.getElementById('stop-btn').style.display='block';
+    } else {
+      startInitialScan();
+    }
+  }catch(e){
+    document.body.innerHTML='<div style="color:#ff4757;font-family:monospace;padding:40px">Boot error: '+e.message+'<br><br>Check that the container is running:<br>docker logs watchdog</div>';
+  }
+})();
+
+function showApp(){
+  document.getElementById('app').style.display='flex';
+  document.getElementById('app').style.flexDirection='column';
+  document.getElementById('app').style.flex='1';
+  loadCfgPanel();
+}
+
+// ── Page nav ──────────────────────────────────────────────────────────────────
+function showPage(name,el){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  el.classList.add('active');
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────────────
+async function replayLogs(){
+  try{
+    const entries=await(await fetch('/api/logs/history')).json();
+    if(entries.length){
+      // Add oldest first so newest ends up at top after insertBefore
+      entries.forEach(e=>addLog(e.time,e.level,e.msg));
+    }
+  }catch(e){}
+}
+function startLogStream(){
+  if(logStreamStarted)return;
+  logStreamStarted=true;
+  const es=new EventSource('/api/logs/stream');
+  es.onmessage=e=>{const d=JSON.parse(e.data);if(!d.ping)addLog(d.time,d.level,d.msg)};
+}
+function addLog(t,l,m){
+  const out=document.getElementById('console-out');
+  const line=document.createElement('div');
+  line.className='ll';
+  line.innerHTML=`<span class="lt">${t}</span><span class="lv ${l}">${l}</span><span class="lm">${esc(m)}</span>`;
+  out.insertBefore(line, out.firstChild);
+  // Keep only 10 newest
+  while(out.children.length>10) out.removeChild(out.lastChild);
+}
+function clearLog(){document.getElementById('console-out').innerHTML=''}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+// ── Setup wizard ──────────────────────────────────────────────────────────────
+let curPage=1;
+function goPage(n){
+  document.getElementById(`sp${curPage}`).classList.remove('active');
+  document.getElementById(`t${curPage}`).classList.remove('active');
+  if(n>curPage)document.getElementById(`t${curPage}`).classList.add('done');
+  curPage=n;
+  document.getElementById(`sp${n}`).classList.add('active');
+  document.getElementById(`t${n}`).classList.add('active');
+}
+function setupData(){
+  return{
+    PLEX_URL:document.getElementById('s-pu').value.trim(),
+    PLEX_TOKEN:document.getElementById('s-pt').value.trim(),
+    PLEX_TV_LIBRARY:document.getElementById('s-pl').value.trim(),
+    SONARR_URL:document.getElementById('s-su').value.trim(),
+    SONARR_API_KEY:document.getElementById('s-sk').value.trim(),
+    SONARR_ROOT_FOLDER:document.getElementById('s-rf').value.trim(),
+    SONARR_QUALITY_PROFILE:document.getElementById('s-qp').value.trim(),
+    TMDB_API_KEY:document.getElementById('s-tm').value.trim(),
+    POLL_INTERVAL:parseInt(document.getElementById('s-pi').value)||30,
+  };
+}
+async function testConn(svc){
+  showTR(svc,null,'Testing...');
+  const r=await fetch('/api/test-connections',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(setupData())});
+  const d=await r.json();
+  if(svc==='plex')  d.plex   ?showTR('plex',  true,'✅ Connected!')  :showTR('plex',  false,`❌ ${d.errors.plex  ||'Failed'}`);
+  if(svc==='sonarr')d.sonarr ?showTR('sonarr',true,'✅ Connected!')  :showTR('sonarr',false,`❌ ${d.errors.sonarr||'Failed'}`);
+  if(svc==='tmdb')  d.tmdb   ?showTR('tmdb',  true,'✅ Valid!')       :showTR('tmdb',  false,`❌ ${d.errors.tmdb  ||'Invalid'}`);
+}
+function showTR(svc,ok,msg){
+  const el=document.getElementById(`tr-${svc}`);
+  el.className='test-result show '+(ok===null?'':ok?'ok':'fail');
+  el.textContent=msg;
+}
+async function saveSetup(){
+  await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(setupData())});
+  goPage(4);
+}
+function launchApp(){
+  document.getElementById('setup-overlay').classList.remove('show');
+  showApp();
+  startLogStream();
+  startInitialScan();
+}
+
+// ── Initial scan ──────────────────────────────────────────────────────────────
+async function startInitialScan(){
+  // Check if scan already running before triggering
+  const check=await(await fetch('/api/status')).json();
+  if(check.scanRunning||check.watchdogRunning){
+    setPill('running','🐕 RUNNING');
+    document.getElementById('stop-btn').style.display='block';
+    return;
+  }
+  document.getElementById('scan-progress').style.display='block';
+  setPill('scanning','🔍 SCANNING');
+  addLog(now(),'INFO','🚀 Starting initial Plex scan — adding continuing shows to Sonarr...');
+  await fetch('/api/start-initial-scan',{method:'POST'});
+  // Poll status until watchdog is running
+  const poll=setInterval(async()=>{
+    const d=await(await fetch('/api/status')).json();
+    if(d.watchdogRunning){
+      clearInterval(poll);
+      document.getElementById('scan-progress').style.display='none';
+      setPill('running','🐕 RUNNING');
+      document.getElementById('stop-btn').style.display='block';
+    }
+  },2000);
+}
+
+// ── Config panel ──────────────────────────────────────────────────────────────
+async function loadCfgPanel(){
+  const cfg=await(await fetch('/api/config')).json();
+  document.getElementById('c-pu').value=cfg.PLEX_URL||'';
+  document.getElementById('c-pt').value=cfg.PLEX_TOKEN||'';
+  document.getElementById('c-pl').value=cfg.PLEX_TV_LIBRARY||'';
+  document.getElementById('c-su').value=cfg.SONARR_URL||'';
+  document.getElementById('c-sk').value=cfg.SONARR_API_KEY||'';
+  document.getElementById('c-rf').value=cfg.SONARR_ROOT_FOLDER||'';
+  document.getElementById('c-qp').value=cfg.SONARR_QUALITY_PROFILE||'';
+  document.getElementById('c-tm').value=cfg.TMDB_API_KEY||'';
+  document.getElementById('c-pi').value=cfg.POLL_INTERVAL||30;
+  document.getElementById('c-al').checked=cfg.AUTO_LINK!==false;
+}
+function toggleCfg(){const p=document.getElementById('cfg-panel');p.style.display=p.style.display==='block'?'none':'block'}
+async function saveCfg(){
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    PLEX_URL:document.getElementById('c-pu').value,
+    PLEX_TOKEN:document.getElementById('c-pt').value,
+    PLEX_TV_LIBRARY:document.getElementById('c-pl').value,
+    SONARR_URL:document.getElementById('c-su').value,
+    SONARR_API_KEY:document.getElementById('c-sk').value,
+    SONARR_ROOT_FOLDER:document.getElementById('c-rf').value,
+    SONARR_QUALITY_PROFILE:document.getElementById('c-qp').value,
+    TMDB_API_KEY:document.getElementById('c-tm').value,
+    POLL_INTERVAL:parseInt(document.getElementById('c-pi').value),
+    AUTO_LINK:document.getElementById('c-al').checked,
+  })});
+  toggleCfg();
+}
+
+// ── Watchdog ──────────────────────────────────────────────────────────────────
+async function stopWatchdog(){
+  await fetch('/api/watchdog/stop',{method:'POST'});
+  setPill('idle','■ STOPPED');
+  document.getElementById('stop-btn').style.display='none';
+}
+
+// ── Series page ───────────────────────────────────────────────────────────────
+async function loadSeries(){
+  document.getElementById('series-list').innerHTML='<div style="color:var(--muted);font-family:\\'JetBrains Mono\\',monospace;font-size:12px;padding:20px 0">Loading from Sonarr...</div>';
+  try{
+    allSeries=await(await fetch('/api/series/list')).json();
+    renderSeries();
+  }catch(e){
+    document.getElementById('series-list').innerHTML='<div style="color:var(--danger);font-family:\\'JetBrains Mono\\',monospace;font-size:12px;padding:20px 0">Failed to load series.</div>';
+  }
+}
+function setSF(f,el){
+  seriesFilter=f;
+  document.querySelectorAll('.sf-tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  renderSeries();
+}
+function filterSeries(){renderSeries()}
+function ongoing(s){return['continuing','returning series','in production','planned','pilot'].includes((s.status||'').toLowerCase())}
+function renderSeries(){
+  const q=(document.getElementById('series-search').value||'').toLowerCase();
+  let list=allSeries.filter(s=>!q||s.title.toLowerCase().includes(q));
+  if(seriesFilter==='ongoing')list=list.filter(s=>ongoing(s));
+  if(seriesFilter==='ended')  list=list.filter(s=>!ongoing(s));
+  if(seriesFilter==='pending')list=list.filter(s=>s.episodeFileCount<s.episodeCount);
+  const el=document.getElementById('series-list');
+  if(!list.length){el.innerHTML='<div style="color:var(--muted);font-family:\\'JetBrains Mono\\',monospace;font-size:12px;padding:20px 0">No series found.</div>';return}
+  el.innerHTML=list.map(s=>{
+    const pct=s.episodeCount>0?Math.round(s.episodeFileCount/s.episodeCount*100):0;
+    const done=s.episodeCount>0&&s.episodeFileCount>=s.episodeCount;
+    const poster=s.poster?`<img class="sr-poster" src="${s.poster}" loading="lazy">`:`<div class="sr-poster-ph">📺</div>`;
+    return`<div class="sr" id="sr-${s.id}">
+      ${poster}
+      <div class="sr-info">
+        <div class="sr-title">${esc(s.title)}</div>
+        <div class="sr-bar-wrap">
+          <div class="sr-bar"><div class="sr-bar-fill" style="width:${pct}%"></div></div>
+          <div class="sr-eps">${s.episodeFileCount}/${s.episodeCount} eps</div>
+        </div>
+      </div>
+      <div class="sr-pill ${ongoing(s)?'ongoing':'ended'}">${ongoing(s)?'ONGOING':'ENDED'}</div>
+      <button class="link-btn ${done?'done':''}" id="lb-${s.id}" onclick="linkSeries(${s.id},'${esc(s.title).replace(/'/g,"\\\\'")}')">
+        ${done?'✓ Done':'Rescan'}
+      </button>
+    </div>`;
+  }).join('');
+}
+async function linkSeries(id,title){
+  const btn=document.getElementById(`lb-${id}`);
+  btn.disabled=true;btn.textContent='⏳ Rescanning...';
+  showPage('dashboard',document.querySelector('.nav-tab'));
+  addLog(now(),'INFO',`🔍 Rescanning: ${title}`);
+  await fetch(`/api/series/${id}/link`,{method:'POST'});
+  setTimeout(async()=>{allSeries=await(await fetch('/api/series/list')).json();renderSeries()},4000);
+}
+async function linkAll(){
+  const btn=event.target;
+  btn.disabled=true;btn.textContent='⏳ Linking all...';
+  showPage('dashboard',document.querySelector('.nav-tab'));
+  addLog(now(),'INFO','🔍 Triggering rescan for all series...');
+  await fetch('/api/series/link-all',{method:'POST'});
+  setTimeout(()=>{btn.disabled=false;btn.textContent='🔍 Rescan All'},2000);
+  setTimeout(async()=>{allSeries=await(await fetch('/api/series/list')).json();renderSeries()},8000);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function setPill(state,label){
+  const p=document.getElementById('status-pill');
+  p.className='status-pill '+(state==='running'?'running':state==='scanning'?'scanning':'');
+  p.innerHTML=`<div class="dot ${state!=='idle'?'pulse':''}"></div> ${label}`;
+}
+function now(){return new Date().toTimeString().slice(0,8)}
+
+// ── Delete & re-add ───────────────────────────────────────────────────────────
+let deleteTarget={id:null,title:''};
+
+function confirmDelete(id,title,e){
+  e.stopPropagation();
+  deleteTarget={id,title};
+  document.getElementById('modal-series-title').textContent=title;
+  document.getElementById('modal-overlay').classList.add('show');
+}
+function closeModal(){document.getElementById('modal-overlay').classList.remove('show')}
+
+async function doDelete(){
+  closeModal();
+  const {id,title}=deleteTarget;
+  addLog(now(),'INFO',`🗑 Deleting '${title}' from Sonarr...`);
+  const r=await fetch(`/api/series/${id}/delete`,{method:'POST'});
+  const d=await r.json();
+  if(d.ok){
+    addLog(now(),'INFO',`✅ '${title}' deleted`);
+    allSeries=allSeries.filter(s=>s.id!==id);
+    renderSeries();
+  } else {
+    addLog(now(),'ERROR',`❌ Delete failed: ${d.error}`);
+  }
+}
+
+async function checkPendingReadd(){
+  const r=await fetch('/api/pending-readd');
+  const items=await r.json();
+  const banner=document.getElementById('readd-banner');
+  if(!items.length){banner.style.display='none';return}
+  banner.style.display='block';
+  banner.innerHTML=`
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--danger);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">⚠ Previously deleted shows detected in Plex</div>
+    ${items.map(item=>`
+      <div class="readd-item">
+        <div>
+          <div class="readd-title">${esc(item.title)}</div>
+          <div class="readd-sub">Found in Plex — was previously deleted from Sonarr</div>
+        </div>
+        <button class="btn btn-success btn-sm" onclick="confirmReadd(${item.tvdbId},'${esc(item.title).replace(/'/g,"\\'")}')">Re-add</button>
+        <button class="btn btn-secondary btn-sm" onclick="dismissReadd(${item.tvdbId})">Ignore</button>
+      </div>`).join('')}`;
+}
+
+async function confirmReadd(tvdbId,title){
+  addLog(now(),'INFO',`✅ Re-adding '${title}' to Sonarr...`);
+  await fetch('/api/pending-readd/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tvdbId,title})});
+  checkPendingReadd();
+}
+async function dismissReadd(tvdbId){
+  await fetch('/api/pending-readd/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tvdbId})});
+  checkPendingReadd();
+}
+
+// Poll for pending re-adds every 30s
+setInterval(checkPendingReadd, 30000);
+checkPendingReadd();
+</script>
+</body>
+</html>
+"""
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_FILE = "/data/config.json"
@@ -185,14 +823,30 @@ def add_series_to_sonarr(tvdb_id, title, quality_profile_id, tmdb_id=None):
         return False
 
 # ── Symlink health check ─────────────────────────────────────────────────────
-def check_and_repair_symlinks(sonarr_map):
+def check_and_repair_symlinks(plex, sonarr_map):
     """
-    Walk every Sonarr series folder, find symlinks, and verify they point
-    to a real file. Broken ones are removed so they can be recreated on the
-    next symlink pass.
+    Walk every Sonarr series folder, find broken symlinks, then try to find
+    the correct file from Plex and recreate the symlink pointing to it.
     """
     repaired = 0
     removed  = 0
+
+    # Build a filename -> plex file path lookup from Plex library
+    logger.debug("🔧 Building Plex file index for symlink repair...")
+    plex_file_map = {}  # basename -> full path
+    try:
+        tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+        for show in tv_lib.all():
+            for season in show.seasons():
+                for ep in season.episodes():
+                    try:
+                        fp = ep.media[0].parts[0].file
+                        plex_file_map[os.path.basename(fp)] = fp
+                    except (IndexError, AttributeError):
+                        pass
+    except Exception as e:
+        logger.warning(f"  ⚠ Could not build Plex file index: {e}")
+
     for tvdb_id, series in sonarr_map.items():
         path = series.get("path", "")
         if not path or not os.path.isdir(path):
@@ -200,18 +854,35 @@ def check_and_repair_symlinks(sonarr_map):
         for root, dirs, files in os.walk(path):
             for fname in files:
                 fpath = os.path.join(root, fname)
-                if os.path.islink(fpath):
-                    target = os.readlink(fpath)
-                    if not os.path.exists(fpath):
-                        # Broken symlink — remove it
-                        try:
-                            os.remove(fpath)
-                            removed += 1
-                            logger.info(f"  🔧 Removed broken symlink: {fname} → {target}")
-                        except Exception as e:
-                            logger.warning(f"  ⚠ Could not remove broken symlink {fname}: {e}")
-    if removed:
-        logger.info(f"🔧 Symlink health check — {removed} broken symlinks removed")
+                if not os.path.islink(fpath):
+                    continue
+                if os.path.exists(fpath):
+                    continue  # symlink is healthy
+
+                # Broken symlink — try to find replacement in Plex
+                old_target = os.readlink(fpath)
+                try:
+                    os.remove(fpath)
+                    removed += 1
+                except Exception as e:
+                    logger.warning(f"  ⚠ Could not remove broken symlink {fname}: {e}")
+                    continue
+
+                # Look up by filename in Plex
+                new_target = plex_file_map.get(fname)
+                if new_target and os.path.exists(new_target):
+                    try:
+                        os.symlink(new_target, fpath)
+                        repaired += 1
+                        logger.info(f"  🔧 Repaired symlink: {fname}")
+                        logger.debug(f"      {old_target} → {new_target}")
+                    except Exception as e:
+                        logger.warning(f"  ⚠ Could not recreate symlink for {fname}: {e}")
+                else:
+                    logger.info(f"  🗑 Removed broken symlink (no Plex match): {fname}")
+
+    if repaired or removed:
+        logger.info(f"🔧 Symlink repair — {repaired} repaired, {removed - repaired} removed (no match found)")
     else:
         logger.debug("🔧 Symlink health check — all symlinks OK")
     return removed
@@ -428,7 +1099,7 @@ def do_watchdog_loop():
 
             # Step 2: always check and repair broken symlinks
             sonarr_map = get_sonarr_series_map()
-            broken = check_and_repair_symlinks(sonarr_map)
+            broken = check_and_repair_symlinks(plex, sonarr_map)
 
             # Step 3: if auto-link on, symlink new files and rescan
             if CONFIG.get("AUTO_LINK", True):
@@ -488,7 +1159,9 @@ def auto_start():
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template("index.html", config=CONFIG)
+    from jinja2 import Template
+    tmpl = Template(INDEX_HTML)
+    return tmpl.render(config=CONFIG)
 
 @app.route("/api/config", methods=["GET","POST"])
 def api_config():
