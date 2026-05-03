@@ -563,7 +563,6 @@ function renderSeries(){
       </button>
       <button class="link-btn" style="border-color:var(--danger);color:var(--danger)" onclick="event.stopPropagation();confirmDelete(${s.id},s.title)">🗑</button>
     </div>`;
-    </div>`;
 }
 async function linkSeries(id,title){
   const btn=document.getElementById(`lb-${id}`);
