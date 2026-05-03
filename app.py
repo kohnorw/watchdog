@@ -164,6 +164,7 @@ def add_series_to_sonarr(tvdb_id, title, quality_profile_id):
             logger.warning(f"  ⚠ No lookup result for '{title}' (TVDB:{tvdb_id})")
             return False
         lookup = results[0]
+        # Monitor all seasons, Sonarr will only track missing episodes
         seasons = [dict(s, monitored=True) for s in lookup.get("seasons", [])]
         payload = {
             "title":            lookup["title"],
@@ -172,10 +173,14 @@ def add_series_to_sonarr(tvdb_id, title, quality_profile_id):
             "rootFolderPath":   CONFIG["SONARR_ROOT_FOLDER"],
             "seasonFolder":     True,
             "monitored":        True,
-            "addOptions":       {"searchForMissingEpisodes": False, "searchForCutoffUnmetEpisodes": False, "monitor": "all"},
-            "seasons":          seasons,
-            "images":           lookup.get("images", []),
-            "path":             f"{CONFIG['SONARR_ROOT_FOLDER']}/{lookup['title']}",
+            "addOptions": {
+                "monitor":                      "missingOnly",
+                "searchForMissingEpisodes":     True,
+                "searchForCutoffUnmetEpisodes": False,
+            },
+            "seasons":  seasons,
+            "images":   lookup.get("images", []),
+            "path":     f"{CONFIG['SONARR_ROOT_FOLDER']}/{lookup['title']}",
         }
         added = sonarr_post("series", payload)
         sonarr_id = added.get("id")
