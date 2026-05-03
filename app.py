@@ -199,108 +199,153 @@ def normalize(s):
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def find_debrid_files_for_series(title):
+def build_debrid_index(debrid_path):
+    """Build a flat index of all video files in debrid: {filename: full_path}"""
+    index = {}
+    try:
+        for folder in os.listdir(debrid_path):
+            fp = os.path.join(debrid_path, folder)
+            if not os.path.isdir(fp):
+                continue
+            for root, dirs, files in os.walk(fp):
+                for fname in files:
+                    if os.path.splitext(fname)[1].lower() in VIDEO_EXTS:
+                        index[fname] = os.path.join(root, fname)
+    except Exception as e:
+        logger.warning(f"  ⚠ Could not build debrid index: {e}")
+    return index
+
+def get_plex_files_for_series(title, tvdb_id):
     """
-    Multi-strategy debrid folder search:
-    1. Exact grep on full title
-    2. Grep on each significant word individually
-    3. Fuzzy normalize + compare all folder names
-    Falls through each strategy until files are found.
+    Ask Plex for all episode file paths for this series.
+    Returns list of (season_num, ep_num, file_path) tuples.
+    """
+    try:
+        plex   = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+        tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+        results = []
+        for show in tv_lib.all():
+            match = False
+            if tvdb_id:
+                for guid in show.guids:
+                    if "tvdb://" in guid.id:
+                        try:
+                            if int(guid.id.replace("tvdb://", "")) == tvdb_id:
+                                match = True
+                        except ValueError:
+                            pass
+            if not match and show.title.lower() == title.lower():
+                match = True
+            if not match:
+                continue
+            for season in show.seasons():
+                snum = season.seasonNumber
+                if snum == 0:
+                    continue
+                for ep in season.episodes():
+                    try:
+                        fpath = ep.media[0].parts[0].file
+                        results.append((snum, ep.index, fpath))
+                    except (IndexError, AttributeError):
+                        pass
+            break
+        return results
+    except Exception as e:
+        logger.warning(f"  ⚠ Plex lookup failed for '{title}': {e}")
+        return []
+
+def find_debrid_files_for_series(title, tvdb_id=None):
+    """
+    1. Get all episode file paths from Plex for this series
+    2. For each Plex file, check if the filename exists in debrid
+    3. Only return files that exist and are accessible in debrid
     """
     debrid_path = CONFIG.get("DEBRID_PATH", "").strip()
     if not debrid_path or not os.path.isdir(debrid_path):
         logger.warning(f"  ⚠ Debrid path not found: {debrid_path}")
         return []
 
-    # Strip year like "Show Name (2020)" -> "Show Name"
+    logger.info(f"  🔍 Getting episode list from Plex for '{title}'...")
+    plex_files = get_plex_files_for_series(title, tvdb_id)
+
+    if not plex_files:
+        logger.info(f"  ⚠ No Plex episodes found for '{title}' — falling back to debrid scan")
+        return find_debrid_files_fallback(title, debrid_path)
+
+    logger.info(f"  📺 Plex has {len(plex_files)} episodes — cross-referencing with debrid...")
+    debrid_index = build_debrid_index(debrid_path)
+    logger.info(f"  📦 Debrid index: {len(debrid_index)} video files")
+
+    found = []
+    missing = []
+    for snum, enum, plex_path in plex_files:
+        fname = os.path.basename(plex_path)
+        # Check if exact filename exists in debrid
+        if fname in debrid_index:
+            debrid_file = debrid_index[fname]
+            if os.path.exists(debrid_file):
+                found.append(debrid_file)
+                logger.debug(f"    ✅ S{snum:02}E{enum:02} found in debrid: {fname}")
+            else:
+                missing.append(f"S{snum:02}E{enum:02}")
+                logger.debug(f"    ⚠ S{snum:02}E{enum:02} in index but not accessible: {fname}")
+        else:
+            # Try matching by SxxExx pattern in case filename differs
+            ep_pattern = re.compile(rf"[Ss]{snum:02}[Ee]{enum:02}", re.IGNORECASE)
+            alt = next((v for k, v in debrid_index.items() if ep_pattern.search(k) and
+                        normalize(title.split("(")[0]) in normalize(k)), None)
+            if alt and os.path.exists(alt):
+                found.append(alt)
+                logger.debug(f"    ✅ S{snum:02}E{enum:02} matched by pattern: {os.path.basename(alt)}")
+            else:
+                missing.append(f"S{snum:02}E{enum:02}")
+                logger.debug(f"    ❌ S{snum:02}E{enum:02} not found in debrid: {fname}")
+
+    logger.info(f"  ✅ {len(found)} accessible in debrid, {len(missing)} not found/accessible")
+    if missing:
+        logger.debug(f"  Missing: {', '.join(missing[:10])}{'...' if len(missing)>10 else ''}")
+    return found
+
+def find_debrid_files_fallback(title, debrid_path):
+    """Fallback: search debrid folder by show name when Plex has no data."""
     clean_title = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
     norm_title  = normalize(clean_title)
-
-    logger.info(f"  🔍 Searching debrid for '{clean_title}'")
-
-    # Get full folder list once
+    logger.info(f"  🔍 Fallback debrid search for '{clean_title}'")
     try:
         all_folders = os.listdir(debrid_path)
     except Exception as e:
-        logger.warning(f"  ⚠ Could not list debrid path: {e}")
+        logger.warning(f"  ⚠ Could not list debrid: {e}")
         return []
 
-    matched = []
-
-    # Strategy 1: exact grep (case insensitive)
-    try:
-        result = subprocess.run(
-            f"ls {repr(debrid_path)} | grep -i {repr(clean_title)}",
-            shell=True, capture_output=True, text=True
-        )
-        matched = [f.strip() for f in result.stdout.strip().splitlines() if f.strip()]
-        if matched:
-            logger.info(f"  ✅ Strategy 1 (exact grep) matched: {', '.join(matched)}")
-    except Exception as e:
-        logger.debug(f"  Strategy 1 failed: {e}")
-
-    # Strategy 2: grep each significant word (3+ chars)
-    if not matched:
-        words = [w for w in clean_title.split() if len(w) >= 3
-                 and w.lower() not in {"the","and","for","with","from","this","that","are","was","has","not"}]
-        word_matches = set()
-        for word in words:
-            try:
-                result = subprocess.run(
-                    f"ls {repr(debrid_path)} | grep -i {repr(word)}",
-                    shell=True, capture_output=True, text=True
-                )
-                hits = [f.strip() for f in result.stdout.strip().splitlines() if f.strip()]
-                word_matches.update(hits)
-            except Exception:
-                pass
-        if word_matches:
-            # Filter to folders where most words match
-            scored = []
-            for folder in word_matches:
-                norm_f = normalize(folder)
-                score  = sum(1 for w in words if w.lower() in norm_f)
-                scored.append((score, folder))
-            scored.sort(reverse=True)
-            best_score = scored[0][0] if scored else 0
-            matched = [f for s, f in scored if s >= max(1, best_score - 1)]
-            if matched:
-                logger.info(f"  ✅ Strategy 2 (word grep) matched: {', '.join(matched)}")
-
-    # Strategy 3: fuzzy normalize compare
-    if not matched:
-        norm_words = norm_title.split()
-        scored = []
-        for folder in all_folders:
-            norm_f = normalize(folder)
-            score  = sum(1 for w in norm_words if w in norm_f)
-            if score > 0:
-                scored.append((score, folder))
-        scored.sort(reverse=True)
-        if scored:
-            best = scored[0][0]
-            matched = [f for s, f in scored if s >= max(1, best - 1)]
-            logger.info(f"  ✅ Strategy 3 (fuzzy) matched: {', '.join(matched)}")
-
-    if not matched:
+    # Score each folder
+    norm_words = norm_title.split()
+    scored = []
+    for folder in all_folders:
+        norm_f = normalize(folder)
+        score  = sum(1 for w in norm_words if w in norm_f)
+        if score > 0:
+            scored.append((score, folder))
+    scored.sort(reverse=True)
+    if not scored:
         logger.info(f"  ❌ No debrid folder found for '{clean_title}'")
         return []
 
-    # Walk matched folders and collect video files
+    best = scored[0][0]
+    matched = [f for s, f in scored if s >= max(1, best - 1)]
+    logger.info(f"  📁 Fallback matched: {', '.join(matched)}")
+
     files = []
     for folder in matched:
         folder_path = os.path.join(debrid_path, folder)
         if not os.path.isdir(folder_path):
             continue
-        count = 0
         for root, dirs, fnames in os.walk(folder_path):
             for fname in fnames:
                 if os.path.splitext(fname)[1].lower() in VIDEO_EXTS:
-                    files.append(os.path.join(root, fname))
-                    count += 1
-        logger.info(f"    📼 {folder} — {count} video files")
-
-    logger.info(f"  📦 Total files found for '{clean_title}': {len(files)}")
+                    full = os.path.join(root, fname)
+                    if os.path.exists(full):
+                        files.append(full)
+    logger.info(f"  📦 Fallback found {len(files)} accessible files")
     return files
 
 def symlink_series(sonarr_series):
@@ -310,7 +355,7 @@ def symlink_series(sonarr_series):
         logger.warning(f"  ⚠ No Sonarr path for '{title}'")
         return 0
 
-    debrid_files = find_debrid_files_for_series(title)
+    debrid_files = find_debrid_files_for_series(title, tvdb_id=sonarr_series.get("tvdbId"))
     if not debrid_files:
         return 0
 
