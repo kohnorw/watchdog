@@ -22,7 +22,7 @@ CONFIG_DEFAULTS = {
     "PLEX_TV_LIBRARY":        "TV Shows",
     "SONARR_URL":             "",
     "SONARR_API_KEY":         "",
-    "SONARR_ROOT_FOLDER":     "/tv",
+    "SONARR_ROOT_FOLDER":     "/docker/sonarr/plex/shows",
     "SONARR_QUALITY_PROFILE": "HD-1080p",
     "TMDB_API_KEY":           "",
     "DEBRID_PATH":            "/docker/zurg/mnt/zurg/shows",
@@ -180,9 +180,10 @@ def add_series_to_sonarr(tvdb_id, title, quality_profile_id):
         added = sonarr_post("series", payload)
         sonarr_id = added.get("id")
         logger.info(f"  ✅ Added: {lookup['title']} (TVDB:{tvdb_id}) — all episodes marked missing")
-        if sonarr_id:
-            time.sleep(2)
-            rescan_series(sonarr_id, lookup["title"])
+        # Immediately symlink any available debrid files for this new series
+        time.sleep(1)
+        logger.info(f"  🔗 Creating symlinks for newly added series: {lookup['title']}")
+        symlink_series(added)
         return True
     except requests.HTTPError as e:
         if e.response.status_code == 400:
@@ -198,6 +199,15 @@ def normalize(s):
     s = re.sub(r'[:\-"!&.,]', " ", s)   # common punctuation to space
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def is_readable(path):
+    """Check if a file is actually readable (not just that the path exists)."""
+    try:
+        with open(path, 'rb') as f:
+            f.read(1024)  # read first 1KB to confirm file is accessible
+        return True
+    except (IOError, OSError):
+        return False
 
 def build_debrid_index(debrid_path):
     """Build a flat index of all video files in debrid: {filename: full_path}"""
@@ -283,23 +293,23 @@ def find_debrid_files_for_series(title, tvdb_id=None):
         # Check if exact filename exists in debrid
         if fname in debrid_index:
             debrid_file = debrid_index[fname]
-            if os.path.exists(debrid_file):
+            if is_readable(debrid_file):
                 found.append(debrid_file)
-                logger.debug(f"    ✅ S{snum:02}E{enum:02} found in debrid: {fname}")
+                logger.debug(f"    ✅ S{snum:02}E{enum:02} readable in debrid: {fname}")
             else:
                 missing.append(f"S{snum:02}E{enum:02}")
-                logger.debug(f"    ⚠ S{snum:02}E{enum:02} in index but not accessible: {fname}")
+                logger.info(f"    ⚠ S{snum:02}E{enum:02} exists but not readable (debrid not cached?): {fname}")
         else:
             # Try matching by SxxExx pattern in case filename differs
             ep_pattern = re.compile(rf"[Ss]{snum:02}[Ee]{enum:02}", re.IGNORECASE)
             alt = next((v for k, v in debrid_index.items() if ep_pattern.search(k) and
                         normalize(title.split("(")[0]) in normalize(k)), None)
-            if alt and os.path.exists(alt):
+            if alt and is_readable(alt):
                 found.append(alt)
                 logger.debug(f"    ✅ S{snum:02}E{enum:02} matched by pattern: {os.path.basename(alt)}")
             else:
                 missing.append(f"S{snum:02}E{enum:02}")
-                logger.debug(f"    ❌ S{snum:02}E{enum:02} not found in debrid: {fname}")
+                logger.debug(f"    ❌ S{snum:02}E{enum:02} not found/readable in debrid: {fname}")
 
     logger.info(f"  ✅ {len(found)} accessible in debrid, {len(missing)} not found/accessible")
     if missing:
@@ -343,10 +353,49 @@ def find_debrid_files_fallback(title, debrid_path):
             for fname in fnames:
                 if os.path.splitext(fname)[1].lower() in VIDEO_EXTS:
                     full = os.path.join(root, fname)
-                    if os.path.exists(full):
+                    if is_readable(full):
                         files.append(full)
     logger.info(f"  📦 Fallback found {len(files)} accessible files")
     return files
+
+def remove_missing_episode_files(sonarr_series):
+    """
+    Check all episode files registered in Sonarr for this series.
+    If the symlink no longer exists or is not readable, delete the episode file
+    record from Sonarr so it knows to re-download it.
+    """
+    title     = sonarr_series["title"]
+    sonarr_id = sonarr_series["id"]
+    try:
+        ep_files = sonarr_get(f"episodefile?seriesId={sonarr_id}")
+    except Exception as e:
+        logger.warning(f"  ⚠ Could not fetch episode files for '{title}': {e}")
+        return 0
+
+    removed = 0
+    for ef in ep_files:
+        path = ef.get("path", "")
+        if not path:
+            continue
+        # Check if the file (symlink) still exists and is readable
+        if os.path.exists(path) and is_readable(path):
+            continue
+        # File is gone or unreadable — remove from Sonarr so it re-downloads
+        try:
+            requests.delete(
+                f"{CONFIG['SONARR_URL']}/api/v3/episodefile/{ef['id']}",
+                headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]},
+                timeout=10
+            ).raise_for_status()
+            removed += 1
+            reason = "unreadable" if os.path.exists(path) else "missing"
+            logger.info(f"  🗑 Removed {reason} episode file from Sonarr: {os.path.basename(path)}")
+        except Exception as e:
+            logger.warning(f"  ⚠ Could not remove episode file {ef['id']}: {e}")
+
+    if removed:
+        logger.info(f"  ✅ '{title}' — {removed} episode files removed from Sonarr (will re-download)")
+    return removed
 
 def symlink_series(sonarr_series):
     title       = sonarr_series["title"]
@@ -388,15 +437,22 @@ def symlink_series(sonarr_series):
 
         dst = os.path.join(season_dir, filename)
 
-        if os.path.islink(dst) and os.path.exists(dst):
+        # Verify source is readable before symlinking
+        if not is_readable(src):
+            logger.info(f"    ⏭ Skipping (not readable in debrid): {filename}")
+            continue
+
+        # Valid readable symlink to same src — skip
+        if os.path.islink(dst) and is_readable(dst):
             if os.readlink(dst) == src:
                 skipped += 1
                 continue
-            logger.info(f"    🔄 Updating symlink: {filename}")
+            logger.info(f"    🔄 Updating symlink (target changed): {filename}")
             os.remove(dst)
             repaired += 1
         elif os.path.islink(dst):
-            logger.info(f"    🔧 Recreating broken symlink: {filename}")
+            reason = "unreadable" if os.path.exists(dst) else "broken"
+            logger.info(f"    🔧 Removing {reason} symlink: {filename}")
             os.remove(dst)
             repaired += 1
         elif os.path.exists(dst):
@@ -406,14 +462,13 @@ def symlink_series(sonarr_series):
         try:
             os.symlink(src, dst)
             created += 1
-            logger.info(f"    🔗 {'Recreated' if repaired else 'Symlinked'}: {filename}")
+            logger.info(f"    🔗 Symlinked: {filename}")
         except Exception as e:
             logger.warning(f"    ⚠ Symlink failed '{filename}': {e}")
 
     total = created + repaired
     if total:
         logger.info(f"  ✅ '{title}' — {created} new, {repaired} repaired, {skipped} unchanged")
-        refresh_and_rescan_series(sonarr_series["id"], title)
     else:
         logger.debug(f"  ✓ '{title}' — {skipped} up to date")
     return created
@@ -465,7 +520,7 @@ def check_and_repair_symlinks(sonarr_map):
                 except Exception:
                     continue
                 new_target = file_map.get(fname)
-                if new_target and os.path.exists(new_target):
+                if new_target and is_readable(new_target):
                     try:
                         os.symlink(new_target, fpath)
                         repaired += 1
@@ -566,8 +621,22 @@ def do_watchdog_loop():
                 logger.info(f"🆕 New show: {show.title} [{status}]")
                 add_series_to_sonarr(tvdb_id, show.title, quality_profile_id)
             sonarr_map = get_sonarr_series_map()
-            check_and_repair_symlinks(sonarr_map)
+
+            # Remove Sonarr episode file records where symlinks are gone/unreadable
+            total_removed = 0
+            for tvdb_id, series in sonarr_map.items():
+                total_removed += remove_missing_episode_files(series)
+            if total_removed:
+                logger.info(f"🗑 Removed {total_removed} missing/unreadable episode files from Sonarr")
+
+            # Repair broken symlinks
+            broken = check_and_repair_symlinks(sonarr_map)
+            if broken:
+                logger.info(f"🔧 Repaired {broken} symlinks")
+
+            # Auto-symlink all series if enabled
             if CONFIG.get("AUTO_SYMLINK", False):
+                logger.info("🔗 Auto-symlink enabled — syncing all series...")
                 symlink_all(sonarr_map)
             else:
                 logger.debug("💤 Auto-symlink off — sync manually from Series page")
@@ -703,8 +772,9 @@ def api_series_link(sonarr_id):
     def run():
         try:
             series = sonarr_get(f"series/{sonarr_id}")
-            logger.info(f"🔗 Symlinking: {series['title']}")
+            logger.info(f"🔗 Symlinking (no Sonarr trigger): {series['title']}")
             symlink_series(series)
+            logger.info(f"✅ Symlinks done for '{series['title']}' — no Sonarr actions triggered")
         except Exception as e:
             logger.error(f"Symlink failed for {sonarr_id}: {e}")
     threading.Thread(target=run, daemon=True).start()
@@ -717,6 +787,21 @@ def api_series_link_all():
             symlink_all(get_sonarr_series_map())
         except Exception as e:
             logger.error(f"Bulk symlink failed: {e}")
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/api/series/<int:sonarr_id>/rescan", methods=["POST"])
+def api_series_rescan(sonarr_id):
+    """Trigger Sonarr refresh + rescan for a single series."""
+    def run():
+        try:
+            series = sonarr_get(f"series/{sonarr_id}")
+            title  = series["title"]
+            logger.info(f"🔄 Triggering refresh + rescan for '{title}'")
+            refresh_and_rescan_series(sonarr_id, title)
+            logger.info(f"✅ Refresh + rescan complete for '{title}'")
+        except Exception as e:
+            logger.error(f"Rescan failed for {sonarr_id}: {e}")
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"ok": True})
 
