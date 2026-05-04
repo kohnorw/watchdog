@@ -22,7 +22,7 @@ CONFIG_DEFAULTS = {
     "PLEX_TV_LIBRARY":        "TV Shows",
     "SONARR_URL":             "",
     "SONARR_API_KEY":         "",
-    "SONARR_ROOT_FOLDER":     "/docker/sonarr/plex/shows",
+    "SONARR_ROOT_FOLDER":     "/tv",
     "SONARR_QUALITY_PROFILE": "HD-1080p",
     "TMDB_API_KEY":           "",
     "DEBRID_PATH":            "/docker/zurg/mnt/zurg/shows",
@@ -557,6 +557,7 @@ def do_initial_scan():
     try:
         sonarr_map         = get_sonarr_series_map()
         quality_profile_id = get_quality_profile_id()
+        logger.info(f"📋 Sonarr has {len(sonarr_map)} series (TVDB IDs: {list(sonarr_map.keys())[:5]}...)")
     except Exception as e:
         logger.error(f"❌ Sonarr connection failed: {e}")
         scan_running = False
@@ -564,7 +565,9 @@ def do_initial_scan():
 
     shows = tv_lib.all()
     logger.info(f"📺 {len(shows)} shows in Plex")
-    added = skipped_ended = skipped_exists = 0
+    logger.info(f"📋 {len(sonarr_map)} series currently in Sonarr")
+
+    added = skipped_ended = skipped_exists = skipped_no_tvdb = 0
     for show in shows:
         tvdb_id = None
         for guid in show.guids:
@@ -572,22 +575,28 @@ def do_initial_scan():
                 try: tvdb_id = int(guid.id.replace("tvdb://", ""))
                 except ValueError: pass
         if not tvdb_id:
+            skipped_no_tvdb += 1
+            logger.debug(f"  ⚠ No TVDB ID for '{show.title}' — skipping")
             continue
         if tvdb_id in sonarr_map:
             skipped_exists += 1
+            logger.debug(f"  ✓ Already in Sonarr: '{show.title}' (TVDB:{tvdb_id})")
             continue
         is_ongoing, status = get_show_status(tvdb_id, show.title)
         if not is_ongoing:
             skipped_ended += 1
+            logger.debug(f"  ⏭ Ended/cancelled: '{show.title}' [{status}]")
             continue
         if tvdb_id in CONFIG.get("IGNORED_SERIES", []):
+            logger.debug(f"  🚫 Ignored: '{show.title}'")
             continue
-        logger.info(f"  📡 Adding: {show.title} [{status}]")
-        add_series_to_sonarr(tvdb_id, show.title, quality_profile_id)
-        added += 1
+        logger.info(f"  📡 Adding: {show.title} (TVDB:{tvdb_id}) [{status}]")
+        if add_series_to_sonarr(tvdb_id, show.title, quality_profile_id):
+            added += 1
+            sonarr_map = get_sonarr_series_map()  # refresh so next iteration sees new entry
         time.sleep(0.3)
 
-    logger.info(f"✅ Scan done — {added} added, {skipped_exists} already in Sonarr, {skipped_ended} ended/skipped")
+    logger.info(f"✅ Scan done — {added} added | {skipped_exists} already in Sonarr | {skipped_ended} ended | {skipped_no_tvdb} no TVDB ID")
     sonarr_map = get_sonarr_series_map()
     symlink_all(sonarr_map)
     CONFIG["INITIAL_SCAN_DONE"] = True
