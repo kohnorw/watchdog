@@ -178,11 +178,6 @@ def add_series_to_sonarr(tvdb_id, title, quality_profile_id):
             "rootFolderPath":   CONFIG["SONARR_ROOT_FOLDER"],
             "seasonFolder":     True,
             "monitored":        True,
-            "addOptions": {
-                "monitor": "all",
-                "searchForMissingEpisodes":     True,
-                "searchForCutoffUnmetEpisodes": False,
-            },
             "seasons": seasons,
             "images":  lookup.get("images", []),
             "path":    f"{CONFIG['SONARR_ROOT_FOLDER']}/{lookup['title']}",
