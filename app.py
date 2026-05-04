@@ -5,7 +5,6 @@ import threading
 import logging
 import json
 import queue
-import subprocess
 import requests
 from datetime import datetime
 from flask import Flask, jsonify, request, Response, stream_with_context
@@ -27,7 +26,7 @@ DEFAULTS = {
     "TMDB_API_KEY":           "",
     "DEBRID_PATH":            "/docker/zurg/mnt/zurg/shows",
     "POLL_INTERVAL":          30,
-    "AUTO_SYMLINK":           False,
+    "PLEX_SCAN_INTERVAL":     120,
     "SETUP_COMPLETE":         False,
     "INITIAL_SCAN_DONE":      False,
     "IGNORED_SERIES":         [],
@@ -44,11 +43,8 @@ def load_config():
     return cfg
 
 def save_config():
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(CONFIG, f, indent=2)
-    except Exception as e:
-        logger.warning(f"Could not save config: {e}")
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(CONFIG, f, indent=2)
 
 CONFIG = load_config()
 
@@ -56,45 +52,149 @@ CONFIG = load_config()
 log_queue        = queue.Queue()
 log_history      = []
 watchdog_running = False
-watchdog_thread  = None
 scan_running     = False
 pending_readd    = []
+debrid_cache     = {}   # {filename: full_path} — rebuilt each scan cycle
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-class QueueHandler(logging.Handler):
+class QH(logging.Handler):
     def emit(self, record):
-        entry = {"time": datetime.now().strftime("%H:%M:%S"),
-                 "level": record.levelname, "msg": self.format(record)}
-        log_queue.put(entry)
-        log_history.append(entry)
+        e = {"time": datetime.now().strftime("%H:%M:%S"),
+             "level": record.levelname, "msg": self.format(record)}
+        log_queue.put(e)
+        log_history.append(e)
         if len(log_history) > 2000:
             log_history.pop(0)
 
-logger = logging.getLogger("watchdog")
+logger = logging.getLogger("wd")
 logger.setLevel(logging.DEBUG)
-qh = QueueHandler()
-qh.setFormatter(logging.Formatter("%(message)s"))
-logger.addHandler(qh)
-sh = logging.StreamHandler()
-sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(sh)
+qh = QH(); qh.setFormatter(logging.Formatter("%(message)s")); logger.addHandler(qh)
+sh = logging.StreamHandler(); sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s")); logger.addHandler(sh)
 
-VIDEO_EXTS    = {".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv"}
+VIDEO_EXTS    = {".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov"}
 ONGOING_STATI = {"returning series", "in production", "planned", "pilot", "continuing"}
 
-# ── Sonarr helpers ─────────────────────────────────────────────────────────────
+# ── Debrid cache ───────────────────────────────────────────────────────────────
+def build_debrid_cache():
+    """Walk debrid path and build {filename: full_path} index."""
+    global debrid_cache
+    debrid = CONFIG.get("DEBRID_PATH", "").strip()
+    if not debrid or not os.path.isdir(debrid):
+        logger.warning(f"⚠ Debrid path not found: {debrid}")
+        return {}
+    cache = {}
+    count = 0
+    for root, dirs, files in os.walk(debrid):
+        for fname in files:
+            if os.path.splitext(fname)[1].lower() in VIDEO_EXTS:
+                cache[fname] = os.path.join(root, fname)
+                count += 1
+    debrid_cache = cache
+    logger.info(f"📦 Debrid cache: {count} files indexed")
+    return cache
+
+def find_in_debrid(plex_path, cache):
+    """
+    Given a Plex file path, find the matching file in debrid cache.
+    1. Exact filename match
+    2. SxxExx pattern match as fallback
+    """
+    fname = os.path.basename(plex_path)
+
+    # Exact match
+    if fname in cache:
+        return cache[fname]
+
+    # Pattern match: find SxxExx in plex filename then search cache
+    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", fname)
+    if m:
+        pattern = re.compile(
+            re.escape(f"S{int(m.group(1)):02}E{int(m.group(2)):02}"), re.IGNORECASE)
+        for cname, cpath in cache.items():
+            if pattern.search(cname):
+                return cpath
+
+    return None
+
+# ── Symlink ────────────────────────────────────────────────────────────────────
+def make_symlink(src, dst):
+    """Create or update a symlink. Returns True if created/updated."""
+    # Already correct symlink — skip
+    if os.path.islink(dst) and os.readlink(dst) == src:
+        return False
+    # Remove stale/broken symlink or existing file
+    if os.path.islink(dst) or os.path.exists(dst):
+        os.remove(dst)
+    try:
+        # Ensure parent directory exists first
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.symlink(src, dst)
+        return True
+    except Exception as e:
+        logger.warning(f"    ⚠ Symlink failed: {e}")
+        return False
+
+def symlink_series_from_plex(plex_show, sonarr_series, cache):
+    """
+    For each episode in Plex, find the file in debrid cache and symlink
+    it into the Sonarr series folder.
+    """
+    title       = sonarr_series.get("title", plex_show.title)
+    series_path = sonarr_series.get("path", "")
+    if not series_path:
+        logger.warning(f"  ⚠ No Sonarr path for '{title}'")
+        return 0
+
+    os.makedirs(series_path, exist_ok=True)
+    os.chmod(series_path, 0o777)
+
+    created = skipped = not_found = 0
+
+    for season in plex_show.seasons():
+        snum = season.seasonNumber
+        if snum == 0:
+            continue
+        for ep in season.episodes():
+            try:
+                plex_path = ep.media[0].parts[0].file
+            except (IndexError, AttributeError):
+                continue
+
+            debrid_file = find_in_debrid(plex_path, cache)
+            if not debrid_file:
+                not_found += 1
+                logger.debug(f"    ❌ Not in debrid: {os.path.basename(plex_path)}")
+                continue
+
+            fname    = os.path.basename(debrid_file)
+            sdir     = os.path.join(series_path, f"Season {snum:02}")
+            os.makedirs(sdir, exist_ok=True)
+            os.chmod(sdir, 0o777)
+            dst = os.path.join(sdir, fname)
+
+            if make_symlink(debrid_file, dst):
+                created += 1
+                logger.info(f"    🆕 New episode linked: S{snum:02}E{ep.index:02} — {fname}")
+            else:
+                skipped += 1
+
+    if created:
+        logger.info(f"  ✅ '{title}': {created} linked, {skipped} unchanged, {not_found} not in debrid")
+    else:
+        logger.debug(f"  ✓ '{title}': {skipped} unchanged, {not_found} not in debrid")
+    return created
+
+# ── Sonarr ─────────────────────────────────────────────────────────────────────
 def sonarr_get(path):
-    r = requests.get(
-        f"{CONFIG['SONARR_URL']}/api/v3/{path}",
-        headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]}, timeout=10)
+    r = requests.get(f"{CONFIG['SONARR_URL']}/api/v3/{path}",
+                     headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]}, timeout=10)
     r.raise_for_status()
     return r.json()
 
 def sonarr_post(path, payload):
-    r = requests.post(
-        f"{CONFIG['SONARR_URL']}/api/v3/{path}",
-        headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]},
-        json=payload, timeout=10)
+    r = requests.post(f"{CONFIG['SONARR_URL']}/api/v3/{path}",
+                      headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]},
+                      json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -105,49 +205,69 @@ def get_quality_profile_id():
             return p["id"]
     return profiles[0]["id"] if profiles else 1
 
-def get_sonarr_series():
-    """Returns list of all series in Sonarr."""
-    return sonarr_get("series")
-
-def build_sonarr_map(series_list):
-    """Build {tvdbId: series} from a series list."""
+def get_sonarr_map():
+    """Returns {tvdbId: series_dict}"""
     result = {}
-    for s in series_list:
+    for s in sonarr_get("series"):
         tid = s.get("tvdbId")
         if tid:
             result[tid] = s
-    logger.info(f"📋 Sonarr map: {len(result)} series")
     return result
 
-def rescan_series(sonarr_id, title):
+def add_to_sonarr(tvdb_id, title, qp_id):
+    """Add series to Sonarr. Returns created series dict or None."""
     try:
-        sonarr_post("command", {"name": "RescanSeries", "seriesId": sonarr_id})
-        logger.info(f"  🔍 Rescan triggered: {title}")
-    except Exception as e:
-        logger.warning(f"  ⚠ Rescan failed for '{title}': {e}")
+        results = sonarr_get(f"series/lookup?term=tvdb:{tvdb_id}")
+        if not results:
+            logger.warning(f"  ⚠ No lookup result for '{title}'")
+            return None
+        lookup  = results[0]
+        seasons = [dict(s, monitored=True) for s in lookup.get("seasons", [])]
+        payload = {
+            "title":            lookup["title"],
+            "tvdbId":           tvdb_id,
+            "qualityProfileId": qp_id,
+            "rootFolderPath":   CONFIG["SONARR_ROOT_FOLDER"],
+            "seasonFolder":     True,
+            "monitored":        True,
+            "seasons":          seasons,
+            "images":           lookup.get("images", []),
+            "path":             f"{CONFIG['SONARR_ROOT_FOLDER']}/{lookup['title']}",
+        }
+        created = sonarr_post("series", payload)
+        logger.info(f"  ✅ Added: {lookup['title']} (TVDB:{tvdb_id})")
+        return created
+    except requests.HTTPError as e:
+        if e.response.status_code == 400:
+            logger.warning(f"  ⚠ Sonarr rejected '{title}': {e.response.text[:150]}")
+        else:
+            logger.error(f"  ❌ Failed to add '{title}': {e.response.status_code}")
+        return None
 
-def refresh_and_rescan(sonarr_id, title):
+def refresh_rescan(sonarr_id, title):
     try:
         sonarr_post("command", {"name": "RefreshSeries", "seriesId": sonarr_id})
         logger.info(f"  🔄 Refresh triggered: {title}")
     except Exception as e:
         logger.warning(f"  ⚠ Refresh failed: {e}")
     time.sleep(2)
-    rescan_series(sonarr_id, title)
+    try:
+        sonarr_post("command", {"name": "RescanSeries", "seriesId": sonarr_id})
+        logger.info(f"  🔍 Rescan triggered: {title}")
+    except Exception as e:
+        logger.warning(f"  ⚠ Rescan failed: {e}")
 
 # ── TMDB ───────────────────────────────────────────────────────────────────────
-def get_show_status(tvdb_id, title):
+def is_ongoing(tvdb_id, title):
     key = CONFIG.get("TMDB_API_KEY", "").strip()
     if key:
         try:
-            r = requests.get(
-                f"https://api.themoviedb.org/3/find/{tvdb_id}",
-                params={"api_key": key, "external_source": "tvdb_id"}, timeout=8)
-            results = r.json().get("tv_results", [])
-            if results:
-                r2 = requests.get(
-                    f"https://api.themoviedb.org/3/tv/{results[0]['id']}",
-                    params={"api_key": key}, timeout=8)
+            r = requests.get(f"https://api.themoviedb.org/3/find/{tvdb_id}",
+                             params={"api_key": key, "external_source": "tvdb_id"}, timeout=8)
+            hits = r.json().get("tv_results", [])
+            if hits:
+                r2 = requests.get(f"https://api.themoviedb.org/3/tv/{hits[0]['id']}",
+                                  params={"api_key": key}, timeout=8)
                 status = r2.json().get("status", "").lower()
                 return status in ONGOING_STATI, status
         except Exception as e:
@@ -161,426 +281,172 @@ def get_show_status(tvdb_id, title):
         pass
     return True, "unknown"
 
-# ── Add series ─────────────────────────────────────────────────────────────────
-def add_series_to_sonarr(tvdb_id, title, quality_profile_id):
-    """Add a series to Sonarr. Returns the created series dict or None."""
-    try:
-        results = sonarr_get(f"series/lookup?term=tvdb:{tvdb_id}")
-        if not results:
-            logger.warning(f"  ⚠ No Sonarr lookup result for '{title}' (TVDB:{tvdb_id})")
-            return None
-        lookup = results[0]
-        seasons = [dict(s, monitored=True) for s in lookup.get("seasons", [])]
-        payload = {
-            "title":            lookup["title"],
-            "tvdbId":           tvdb_id,
-            "qualityProfileId": quality_profile_id,
-            "rootFolderPath":   CONFIG["SONARR_ROOT_FOLDER"],
-            "seasonFolder":     True,
-            "monitored":        True,
-            "seasons": seasons,
-            "images":  lookup.get("images", []),
-            "path":    f"{CONFIG['SONARR_ROOT_FOLDER']}/{lookup['title']}",
-        }
-        created = sonarr_post("series", payload)
-        logger.info(f"  ✅ Added to Sonarr: {lookup['title']} (TVDB:{tvdb_id})")
-        return created
-    except requests.HTTPError as e:
-        if e.response.status_code == 400:
-            try:
-                body = e.response.json()
-            except Exception:
-                body = e.response.text[:200]
-            logger.warning(f"  ⚠ Sonarr rejected '{title}': {body}")
-        else:
-            logger.error(f"  ❌ Failed to add '{title}': {e.response.status_code}")
-        return None
-
-# ── Debrid ─────────────────────────────────────────────────────────────────────
-def normalize(s):
-    s = s.lower()
-    s = re.sub(r'[:\-"!&.,\(\)]', " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def is_readable(path):
-    try:
-        with open(path, "rb") as f:
-            f.read(1024)
-        return True
-    except (IOError, OSError):
-        return False
-
-def find_debrid_files(title):
-    debrid = CONFIG.get("DEBRID_PATH", "").strip()
-    if not debrid or not os.path.isdir(debrid):
-        logger.warning(f"  ⚠ Debrid path not found: {debrid}")
-        return []
-
-    clean = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
-    norm  = normalize(clean)
-    logger.info(f"  🔍 Searching debrid for '{clean}'")
-
-    try:
-        all_folders = os.listdir(debrid)
-    except Exception as e:
-        logger.warning(f"  ⚠ Cannot list debrid: {e}")
-        return []
-
-    # Score every folder
-    norm_words = [w for w in norm.split() if len(w) >= 2]
-    scored = []
-    for folder in all_folders:
-        norm_f = normalize(folder)
-        score  = sum(1 for w in norm_words if w in norm_f)
-        if score > 0:
-            scored.append((score, folder))
-    scored.sort(reverse=True)
-
-    if not scored:
-        logger.info(f"  ❌ No debrid folder found for '{clean}'")
-        return []
-
-    best = scored[0][0]
-    matched = [f for s, f in scored if s >= max(1, best - 1)]
-    logger.info(f"  📁 Matched: {', '.join(matched)}")
-
-    files = []
-    for folder in matched:
-        fp = os.path.join(debrid, folder)
-        if not os.path.isdir(fp):
-            continue
-        count = 0
-        for root, dirs, fnames in os.walk(fp):
-            for fname in fnames:
-                if os.path.splitext(fname)[1].lower() in VIDEO_EXTS:
-                    full = os.path.join(root, fname)
-                    if is_readable(full):
-                        files.append(full)
-                        count += 1
-        logger.info(f"    📼 {folder}: {count} readable files")
-
-    logger.info(f"  📦 Total: {len(files)} files for '{clean}'")
-    return files
-
-def symlink_series(sonarr_series):
-    title       = sonarr_series.get("title", "?")
-    series_path = sonarr_series.get("path", "")
-    if not series_path:
-        logger.warning(f"  ⚠ No path for '{title}'")
-        return 0
-
-    files = find_debrid_files(title)
-    if not files:
-        return 0
-
-    os.makedirs(series_path, exist_ok=True)
-    os.chmod(series_path, 0o777)
-
-    created = repaired = skipped = 0
-    for src in files:
-        fname = os.path.basename(src)
-        snum  = None
-        for part in src.replace("\\", "/").split("/"):
-            if part.lower().startswith("season "):
-                try: snum = int(part.lower().replace("season ", ""))
-                except ValueError: pass
-        if snum is None:
-            m = re.search(r"[Ss](\d{1,2})[Ee]\d{1,2}", fname)
-            if m: snum = int(m.group(1))
-
-        sdir = os.path.join(series_path, f"Season {snum:02}") if snum else series_path
-        os.makedirs(sdir, exist_ok=True)
-        os.chmod(sdir, 0o777)
-        dst = os.path.join(sdir, fname)
-
-        if os.path.islink(dst):
-            if os.path.exists(dst) and os.readlink(dst) == src:
-                skipped += 1
-                continue
-            os.remove(dst)
-            repaired += 1
-        elif os.path.exists(dst):
-            skipped += 1
-            continue
-
-        try:
-            os.symlink(src, dst)
-            created += 1
-            logger.info(f"    🔗 {'Repaired' if repaired else 'Linked'}: {fname}")
-        except Exception as e:
-            logger.warning(f"    ⚠ Symlink failed '{fname}': {e}")
-
-    total = created + repaired
-    if total:
-        logger.info(f"  ✅ '{title}': {created} new, {repaired} repaired, {skipped} unchanged")
-    return created
-
-def symlink_all(sonarr_map):
-    logger.info("🔗 Symlinking all series...")
-    total = 0
-    for tvdb_id, series in sonarr_map.items():
-        total += symlink_series(series)
-        time.sleep(0.1)
-    logger.info(f"✅ Symlink pass done — {total} new")
-
-def repair_symlinks(sonarr_map):
-    debrid = CONFIG.get("DEBRID_PATH", "").strip()
-    if not debrid or not os.path.isdir(debrid):
-        return 0
-    # Build index
-    index = {}
-    try:
-        for folder in os.listdir(debrid):
-            fp = os.path.join(debrid, folder)
-            if os.path.isdir(fp):
-                for root, dirs, files in os.walk(fp):
-                    for f in files:
-                        if os.path.splitext(f)[1].lower() in VIDEO_EXTS:
-                            full = os.path.join(root, f)
-                            if is_readable(full):
-                                index[f] = full
-    except Exception as e:
-        logger.warning(f"⚠ Cannot build debrid index: {e}")
-        return 0
-
-    repaired = removed = 0
-    for series in sonarr_map.values():
-        path = series.get("path", "")
-        if not path or not os.path.isdir(path):
-            continue
-        for root, dirs, files in os.walk(path):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                if not os.path.islink(fpath):
-                    continue
-                if is_readable(fpath):
-                    continue
-                old_target = os.readlink(fpath)
-                try:
-                    os.remove(fpath)
-                    removed += 1
-                except Exception:
-                    continue
-                new_target = index.get(fname)
-                if new_target:
-                    try:
-                        os.symlink(new_target, fpath)
-                        repaired += 1
-                        logger.info(f"  🔧 Repaired: {fname}")
-                    except Exception as e:
-                        logger.warning(f"  ⚠ Repair failed {fname}: {e}")
-                else:
-                    logger.info(f"  🗑 Removed broken symlink: {fname}")
-    if removed:
-        logger.info(f"🔧 Symlink repair: {repaired} repaired, {removed-repaired} removed")
-    return removed
-
-def remove_missing_ep_files(sonarr_map):
-    total = 0
-    for series in sonarr_map.values():
-        sid = series["id"]
-        try:
-            ep_files = sonarr_get(f"episodefile?seriesId={sid}")
-        except Exception:
-            continue
-        for ef in ep_files:
-            path = ef.get("path", "")
-            if not path:
-                continue
-            if is_readable(path):
-                continue
-            try:
-                requests.delete(
-                    f"{CONFIG['SONARR_URL']}/api/v3/episodefile/{ef['id']}",
-                    headers={"X-Api-Key": CONFIG["SONARR_API_KEY"]}, timeout=10
-                ).raise_for_status()
-                total += 1
-                logger.info(f"  🗑 Removed missing ep file: {os.path.basename(path)}")
-            except Exception as e:
-                logger.warning(f"  ⚠ Could not remove ep file: {e}")
-    if total:
-        logger.info(f"🗑 Removed {total} missing episode files from Sonarr")
-    return total
-
 # ── Plex helpers ───────────────────────────────────────────────────────────────
-def get_plex():
-    return PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
-
-def get_plex_shows(plex):
-    return plex.library.section(CONFIG["PLEX_TV_LIBRARY"]).all()
-
 def get_tvdb_id(show):
     for guid in show.guids:
         if "tvdb://" in guid.id:
-            try: return int(guid.id.replace("tvdb://", ""))
-            except ValueError: pass
+            try:
+                return int(guid.id.replace("tvdb://", ""))
+            except ValueError:
+                pass
     return None
 
-# ── Initial scan ───────────────────────────────────────────────────────────────
-def do_initial_scan():
-    global watchdog_running, watchdog_thread, scan_running
+# ── Main scan ──────────────────────────────────────────────────────────────────
+def do_scan():
+    global scan_running, watchdog_running
+
     if scan_running:
         logger.warning("⚠ Scan already running")
         return
     scan_running = True
-    logger.info("🔍 Starting initial Plex scan...")
 
+    logger.info("🔍 Starting scan...")
+
+    # Connect
     try:
-        plex = get_plex()
+        plex   = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
         tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
-        logger.info(f"✅ Connected to Plex: {CONFIG['PLEX_TV_LIBRARY']}")
     except Exception as e:
-        logger.error(f"❌ Plex connection failed: {e}")
+        logger.error(f"❌ Plex error: {e}")
         scan_running = False
         return
 
     try:
         qp_id      = get_quality_profile_id()
-        sonarr_map = build_sonarr_map(get_sonarr_series())
+        sonarr_map = get_sonarr_map()
     except Exception as e:
-        logger.error(f"❌ Sonarr connection failed: {e}")
+        logger.error(f"❌ Sonarr error: {e}")
         scan_running = False
         return
 
-    shows = tv_lib.all()
-    logger.info(f"📺 {len(shows)} shows in Plex | {len(sonarr_map)} already in Sonarr")
+    # Build debrid cache
+    cache = build_debrid_cache()
 
-    added = skipped_exists = skipped_ended = skipped_ignored = skipped_no_id = 0
+    shows = tv_lib.all()
+    logger.info(f"📺 {len(shows)} Plex shows | {len(sonarr_map)} in Sonarr | {len(cache)} debrid files")
+
+    added = existed = skipped_ended = 0
 
     for show in shows:
         tvdb_id = get_tvdb_id(show)
-
         if not tvdb_id:
-            skipped_no_id += 1
             continue
-
-        if tvdb_id in sonarr_map:
-            skipped_exists += 1
-            continue
-
         if tvdb_id in CONFIG.get("IGNORED_SERIES", []):
-            skipped_ignored += 1
             continue
 
-        is_ongoing, status = get_show_status(tvdb_id, show.title)
-        if not is_ongoing:
+        ongoing, status = is_ongoing(tvdb_id, show.title)
+        if not ongoing:
             skipped_ended += 1
             continue
 
-        logger.info(f"  📡 Adding: {show.title} (TVDB:{tvdb_id}) [{status}]")
-        created = add_series_to_sonarr(tvdb_id, show.title, qp_id)
-        if created:
-            added += 1
-            sonarr_map[tvdb_id] = created  # update local map immediately
-        time.sleep(0.5)
+        # Add to Sonarr if not there
+        if tvdb_id not in sonarr_map:
+            logger.info(f"  📡 Adding: {show.title} [{status}]")
+            created = add_to_sonarr(tvdb_id, show.title, qp_id)
+            if created:
+                sonarr_map[tvdb_id] = created
+                added += 1
+            time.sleep(0.3)
+        else:
+            existed += 1
 
-    logger.info(
-        f"✅ Scan complete — {added} added | {skipped_exists} already in Sonarr | "
-        f"{skipped_ended} ended | {skipped_ignored} ignored | {skipped_no_id} no TVDB ID"
-    )
+        # Symlink episodes from Plex → debrid → Sonarr folder
+        if tvdb_id in sonarr_map:
+            symlink_series_from_plex(show, sonarr_map[tvdb_id], cache)
 
-    # Symlink pass
-    logger.info("🔗 Creating symlinks...")
-    sonarr_map = build_sonarr_map(get_sonarr_series())
-    symlink_all(sonarr_map)
+    logger.info(f"✅ Scan done — {added} added, {existed} existed, {skipped_ended} ended")
 
     CONFIG["INITIAL_SCAN_DONE"] = True
     scan_running = False
     save_config()
 
-    logger.info("🐕 Starting watchdog loop...")
+    # Start watchdog loop
     watchdog_running = True
-    watchdog_thread  = threading.Thread(target=watchdog_loop, daemon=True)
-    watchdog_thread.start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
 # ── Watchdog loop ──────────────────────────────────────────────────────────────
 def watchdog_loop():
-    logger.info(f"🐕 Watchdog running every {CONFIG['POLL_INTERVAL']}s")
+    scan_interval = int(CONFIG.get("PLEX_SCAN_INTERVAL", 120))
+    logger.info(f"🐕 Watchdog: scanning Plex every {scan_interval}s")
+    last_scan = 0
+
     while watchdog_running:
-        try:
-            plex       = get_plex()
-            shows      = get_plex_shows(plex)
-            sonarr_map = build_sonarr_map(get_sonarr_series())
-            qp_id      = get_quality_profile_id()
+        now_ts = time.time()
+        if now_ts - last_scan >= scan_interval:
+            last_scan = now_ts
+            try:
+                logger.info("🔍 Scanning Plex for new shows...")
+                plex       = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+                tv_lib     = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+                sonarr_map = get_sonarr_map()
+                qp_id      = get_quality_profile_id()
+                cache      = build_debrid_cache()
+                shows      = tv_lib.all()
 
-            # Check for new shows
-            for show in shows:
-                tvdb_id = get_tvdb_id(show)
-                if not tvdb_id or tvdb_id in sonarr_map:
-                    continue
-                if tvdb_id in CONFIG.get("IGNORED_SERIES", []):
-                    if not any(p["tvdbId"] == tvdb_id for p in pending_readd):
-                        logger.info(f"⚠ '{show.title}' was deleted — awaiting confirmation")
-                        pending_readd.append({"tvdbId": tvdb_id, "title": show.title})
-                    continue
-                is_ongoing, status = get_show_status(tvdb_id, show.title)
-                if not is_ongoing:
-                    continue
-                logger.info(f"🆕 New show: {show.title} [{status}]")
-                created = add_series_to_sonarr(tvdb_id, show.title, qp_id)
-                if created:
-                    sonarr_map[tvdb_id] = created
+                for show in shows:
+                    tvdb_id = get_tvdb_id(show)
+                    if not tvdb_id or tvdb_id in CONFIG.get("IGNORED_SERIES", []):
+                        continue
+                    ongoing, status = is_ongoing(tvdb_id, show.title)
+                    if not ongoing:
+                        continue
+                    if tvdb_id not in sonarr_map:
+                        logger.info(f"🆕 New: {show.title} [{status}]")
+                        created = add_to_sonarr(tvdb_id, show.title, qp_id)
+                        if created:
+                            sonarr_map[tvdb_id] = created
+                        time.sleep(0.3)
+                    if tvdb_id in sonarr_map:
+                        symlink_series_from_plex(show, sonarr_map[tvdb_id], cache)
 
-            # Refresh map
-            sonarr_map = build_sonarr_map(get_sonarr_series())
+                # Update interval in case user changed it
+                scan_interval = int(CONFIG.get("PLEX_SCAN_INTERVAL", 120))
+                logger.debug(f"✅ Scan done. Next in {scan_interval}s")
+            except Exception as e:
+                logger.error(f"Watchdog error: {e}")
 
-            # Remove missing ep files
-            remove_missing_ep_files(sonarr_map)
+        time.sleep(10)  # check every 10s if interval has elapsed
 
-            # Repair broken symlinks
-            repair_symlinks(sonarr_map)
-
-            # Auto-symlink if enabled
-            if CONFIG.get("AUTO_SYMLINK", False):
-                symlink_all(sonarr_map)
-
-        except Exception as e:
-            logger.error(f"Watchdog error: {e}")
-
-        logger.debug(f"💤 Sleeping {CONFIG['POLL_INTERVAL']}s...")
-        time.sleep(CONFIG["POLL_INTERVAL"])
-
-# ── Auto-start on restart ──────────────────────────────────────────────────────
+# ── Auto-start ─────────────────────────────────────────────────────────────────
 def auto_start():
-    global watchdog_running, watchdog_thread
-    logger.info("🔁 Auto-start: checking for new shows...")
+    global watchdog_running
+    logger.info("🔁 Auto-starting...")
+    # Run one full scan cycle then hand off to loop
     try:
-        plex       = get_plex()
-        shows      = get_plex_shows(plex)
-        sonarr_map = build_sonarr_map(get_sonarr_series())
+        plex       = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+        tv_lib     = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+        sonarr_map = get_sonarr_map()
         qp_id      = get_quality_profile_id()
+        cache      = build_debrid_cache()
+        shows      = tv_lib.all()
         added = 0
         for show in shows:
             tvdb_id = get_tvdb_id(show)
-            if not tvdb_id or tvdb_id in sonarr_map:
+            if not tvdb_id or tvdb_id in CONFIG.get("IGNORED_SERIES", []):
                 continue
-            if tvdb_id in CONFIG.get("IGNORED_SERIES", []):
+            ongoing, status = is_ongoing(tvdb_id, show.title)
+            if not ongoing:
                 continue
-            is_ongoing, status = get_show_status(tvdb_id, show.title)
-            if not is_ongoing:
-                continue
-            logger.info(f"  🆕 New: {show.title} [{status}]")
-            created = add_series_to_sonarr(tvdb_id, show.title, qp_id)
-            if created:
-                added += 1
-                sonarr_map[tvdb_id] = created
-            time.sleep(0.5)
-        sonarr_map = build_sonarr_map(get_sonarr_series())
-        symlink_all(sonarr_map)
+            if tvdb_id not in sonarr_map:
+                logger.info(f"  🆕 New: {show.title} [{status}]")
+                created = add_to_sonarr(tvdb_id, show.title, qp_id)
+                if created:
+                    sonarr_map[tvdb_id] = created
+                    added += 1
+                time.sleep(0.3)
+            if tvdb_id in sonarr_map:
+                symlink_series_from_plex(show, sonarr_map[tvdb_id], cache)
         logger.info(f"✅ Auto-start done — {added} new shows")
     except Exception as e:
         logger.error(f"Auto-start error: {e}")
-    logger.info("🐕 Starting watchdog loop...")
     watchdog_running = True
-    watchdog_thread  = threading.Thread(target=watchdog_loop, daemon=True)
-    watchdog_thread.start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    tmpl_path = os.path.join(os.path.dirname(__file__), "templates", "index.html")
-    with open(tmpl_path) as f:
+    p = os.path.join(os.path.dirname(__file__), "templates", "index.html")
+    with open(p) as f:
         return Template(f.read()).render(config=CONFIG)
 
 @app.route("/api/status")
@@ -609,11 +475,10 @@ def api_setup():
             CONFIG[k] = v
     CONFIG["SETUP_COMPLETE"] = True
     save_config()
-    logger.info("✅ Setup complete")
     return jsonify({"ok": True})
 
 @app.route("/api/test-connections", methods=["POST"])
-def api_test_connections():
+def api_test():
     data = request.json or {}
     out  = {"plex": False, "sonarr": False, "tmdb": False, "errors": {}}
     try:
@@ -623,9 +488,8 @@ def api_test_connections():
     except Exception as e:
         out["errors"]["plex"] = str(e)
     try:
-        r = requests.get(
-            f"{data.get('SONARR_URL')}/api/v3/system/status",
-            headers={"X-Api-Key": data.get("SONARR_API_KEY")}, timeout=8)
+        r = requests.get(f"{data.get('SONARR_URL')}/api/v3/system/status",
+                         headers={"X-Api-Key": data.get("SONARR_API_KEY")}, timeout=8)
         r.raise_for_status()
         out["sonarr"] = True
     except Exception as e:
@@ -640,17 +504,17 @@ def api_test_connections():
             out["errors"]["tmdb"] = str(e)
     return jsonify(out)
 
-@app.route("/api/start-initial-scan", methods=["POST"])
-def api_start_initial_scan():
+@app.route("/api/start-scan", methods=["POST"])
+def api_start_scan():
     if not scan_running:
-        threading.Thread(target=do_initial_scan, daemon=True).start()
+        threading.Thread(target=do_scan, daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/api/series/list")
 def api_series_list():
     try:
         out = []
-        for s in get_sonarr_series():
+        for s in sonarr_get("series"):
             stats = s.get("statistics", {})
             out.append({
                 "id":               s["id"],
@@ -668,26 +532,43 @@ def api_series_list():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/series/<int:sid>/link", methods=["POST"])
-def api_series_link(sid):
+@app.route("/api/series/<int:sid>/sync", methods=["POST"])
+def api_series_sync(sid):
+    """Symlink one series from Plex → debrid → Sonarr."""
     def run():
         try:
-            s = sonarr_get(f"series/{sid}")
-            logger.info(f"🔗 Symlinking: {s['title']}")
-            symlink_series(s)
-            logger.info(f"✅ Symlink done for '{s['title']}'")
+            sonarr_series = sonarr_get(f"series/{sid}")
+            tvdb_id       = sonarr_series.get("tvdbId")
+            title         = sonarr_series["title"]
+            logger.info(f"🔗 Syncing: {title}")
+            plex   = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+            tv_lib = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+            cache  = build_debrid_cache()
+            for show in tv_lib.all():
+                if get_tvdb_id(show) == tvdb_id:
+                    symlink_series_from_plex(show, sonarr_series, cache)
+                    break
+            logger.info(f"✅ Sync done: {title}")
         except Exception as e:
-            logger.error(f"Symlink failed: {e}")
+            logger.error(f"Sync failed: {e}")
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"ok": True})
 
-@app.route("/api/series/link-all", methods=["POST"])
-def api_series_link_all():
+@app.route("/api/series/sync-all", methods=["POST"])
+def api_series_sync_all():
+    """Symlink all series."""
     def run():
         try:
-            symlink_all(build_sonarr_map(get_sonarr_series()))
+            plex       = PlexServer(CONFIG["PLEX_URL"], CONFIG["PLEX_TOKEN"])
+            tv_lib     = plex.library.section(CONFIG["PLEX_TV_LIBRARY"])
+            sonarr_map = get_sonarr_map()
+            cache      = build_debrid_cache()
+            for show in tv_lib.all():
+                tvdb_id = get_tvdb_id(show)
+                if tvdb_id and tvdb_id in sonarr_map:
+                    symlink_series_from_plex(show, sonarr_map[tvdb_id], cache)
         except Exception as e:
-            logger.error(f"Bulk symlink failed: {e}")
+            logger.error(f"Sync all failed: {e}")
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"ok": True})
 
@@ -696,7 +577,7 @@ def api_series_rescan(sid):
     def run():
         try:
             s = sonarr_get(f"series/{sid}")
-            refresh_and_rescan(sid, s["title"])
+            refresh_rescan(sid, s["title"])
         except Exception as e:
             logger.error(f"Rescan failed: {e}")
     threading.Thread(target=run, daemon=True).start()
@@ -718,7 +599,7 @@ def api_series_delete(sid):
             ignored.append(tvdb_id)
             CONFIG["IGNORED_SERIES"] = ignored
             save_config()
-        logger.info(f"🗑 Deleted '{title}' and added to ignore list")
+        logger.info(f"🗑 Deleted: {title}")
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -739,9 +620,9 @@ def api_pending_readd_confirm():
         CONFIG["IGNORED_SERIES"] = ignored
         save_config()
     pending_readd = [p for p in pending_readd if p["tvdbId"] != tvdb_id]
-    created = add_series_to_sonarr(tvdb_id, title, get_quality_profile_id())
+    created = add_to_sonarr(tvdb_id, title, get_quality_profile_id())
     if created:
-        logger.info(f"✅ Re-added '{title}'")
+        logger.info(f"✅ Re-added: {title}")
     return jsonify({"ok": True})
 
 @app.route("/api/pending-readd/dismiss", methods=["POST"])
@@ -767,8 +648,8 @@ def api_logs_stream():
     def generate():
         while True:
             try:
-                entry = log_queue.get(timeout=1)
-                yield f"data: {json.dumps(entry)}\n\n"
+                e = log_queue.get(timeout=1)
+                yield f"data: {json.dumps(e)}\n\n"
             except queue.Empty:
                 yield f"data: {json.dumps({'ping': True})}\n\n"
     return Response(stream_with_context(generate()),
@@ -777,6 +658,6 @@ def api_logs_stream():
 
 if __name__ == "__main__":
     if CONFIG.get("INITIAL_SCAN_DONE") and CONFIG.get("SETUP_COMPLETE"):
-        logger.info("🔁 Previous scan detected — auto-starting...")
+        logger.info("🔁 Auto-starting...")
         threading.Thread(target=auto_start, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
