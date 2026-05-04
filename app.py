@@ -179,7 +179,7 @@ def add_series_to_sonarr(tvdb_id, title, quality_profile_id):
             "seasonFolder":     True,
             "monitored":        True,
             "addOptions": {
-                "monitor":                      "missingOnly",
+                "monitor": "all",
                 "searchForMissingEpisodes":     True,
                 "searchForCutoffUnmetEpisodes": False,
             },
